@@ -55,7 +55,6 @@ await app.register(callLogRoutes);
 await app.register(dashboardRoutes);
 
 // Serve dashboard static files in production
-// Serve dashboard static files in production
 const dashboardPath = path.join(__dirname, '../../dashboard/dist');
 const dashboardExists = fs.existsSync(dashboardPath) && fs.existsSync(path.join(dashboardPath, 'index.html'));
 
@@ -65,6 +64,7 @@ if (dashboardExists) {
     prefix: '/',
     wildcard: false,
   });
+  // SPA fallback: serve index.html for any non-API route
   app.setNotFoundHandler((request, reply) => {
     if (request.url.startsWith('/api/')) {
       return reply.status(404).send({ error: 'Not found' });
@@ -84,19 +84,6 @@ if (dashboardExists) {
     });
   });
 }
-  // SPA fallback: serve index.html for any non-API route
-  app.setNotFoundHandler((request, reply) => {
-    if (request.url.startsWith('/api/')) {
-      return reply.status(404).send({ error: 'Not found' });
-    }
-    return reply.sendFile('index.html', dashboardPath);
-  });
-} catch {
-  // Dashboard not built yet — fine in dev
-  app.setNotFoundHandler((request, reply) => {
-    return reply.status(404).send({ error: 'Not found' });
-  });
-}
 
 // Start
 const port = parseInt(process.env.PORT || '3000');
@@ -105,13 +92,21 @@ const host = '0.0.0.0';
 try {
   await app.listen({ port, host });
   console.log(`Server running on ${host}:${port}`);
+  console.log(`Dashboard: ${dashboardExists ? 'serving from ' + dashboardPath : 'not found (API only)'}`);
+  console.log(`Database: ${process.env.DATABASE_URL ? 'configured' : 'NOT SET — check DATABASE_URL env var'}`);
 
-  // Start background workers
+  // Start background workers (don't crash server if workers fail)
   if (process.env.DISABLE_WORKERS !== 'true') {
-    await startWorkers();
+    try {
+      await startWorkers();
+    } catch (workerErr) {
+      console.error('Workers failed to start (server still running):', workerErr.message);
+      console.error('Retries and queue processing will not work until workers are fixed.');
+    }
   }
 } catch (err) {
-  app.log.error(err);
+  console.error('SERVER FAILED TO START:', err.message);
+  console.error('Full error:', err);
   process.exit(1);
 }
 
