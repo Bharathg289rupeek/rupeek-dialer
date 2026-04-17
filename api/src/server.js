@@ -84,19 +84,6 @@ if (dashboardExists) {
     });
   });
 }
-  // SPA fallback: serve index.html for any non-API route
-  app.setNotFoundHandler((request, reply) => {
-    if (request.url.startsWith('/api/')) {
-      return reply.status(404).send({ error: 'Not found' });
-    }
-    return reply.sendFile('index.html', dashboardPath);
-  });
-} catch {
-  // Dashboard not built yet — fine in dev
-  app.setNotFoundHandler((request, reply) => {
-    return reply.status(404).send({ error: 'Not found' });
-  });
-}
 
 // Start
 const port = parseInt(process.env.PORT || '3000');
