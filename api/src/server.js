@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 
@@ -54,14 +55,35 @@ await app.register(callLogRoutes);
 await app.register(dashboardRoutes);
 
 // Serve dashboard static files in production
+// Serve dashboard static files in production
 const dashboardPath = path.join(__dirname, '../../dashboard/dist');
-try {
+const dashboardExists = fs.existsSync(dashboardPath) && fs.existsSync(path.join(dashboardPath, 'index.html'));
+
+if (dashboardExists) {
   await app.register(fastifyStatic, {
     root: dashboardPath,
     prefix: '/',
-    decorateReply: false,
     wildcard: false,
   });
+  app.setNotFoundHandler((request, reply) => {
+    if (request.url.startsWith('/api/')) {
+      return reply.status(404).send({ error: 'Not found' });
+    }
+    return reply.sendFile('index.html');
+  });
+} else {
+  console.log('Dashboard dist not found at', dashboardPath, '- serving API only');
+  app.setNotFoundHandler((request, reply) => {
+    if (request.url.startsWith('/api/')) {
+      return reply.status(404).send({ error: 'Not found' });
+    }
+    return reply.status(200).send({
+      message: 'Rupeek Dialer API is running. Dashboard not built yet.',
+      health: '/health',
+      api: '/api/v1/',
+    });
+  });
+}
   // SPA fallback: serve index.html for any non-API route
   app.setNotFoundHandler((request, reply) => {
     if (request.url.startsWith('/api/')) {
