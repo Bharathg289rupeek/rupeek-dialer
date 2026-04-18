@@ -8,6 +8,31 @@ export default async function routingConfigRoutes(fastify) {
     return res.rows[0] || {};
   });
 
+  // Create new config (if none exists)
+  fastify.post('/api/v1/routing-config', { preHandler: fastify.auth }, async (request, reply) => {
+    const existing = await query(`SELECT id FROM routing_config WHERE is_active = true LIMIT 1`);
+    if (existing.rows.length > 0) {
+      return reply.status(409).send({ error: 'Config already exists', id: existing.rows[0].id });
+    }
+
+    const b = request.body || {};
+    const res = await query(
+      `INSERT INTO routing_config (name, fallback_call_center_number, max_parallel_rms, rm_ring_duration_sec, business_hours_start, business_hours_end, business_days)
+       VALUES ('default', $1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [
+        b.fallback_call_center_number || '+910000000000',
+        b.max_parallel_rms || 3,
+        b.rm_ring_duration_sec || 20,
+        b.business_hours_start || '09:00',
+        b.business_hours_end || '18:00',
+        JSON.stringify(b.business_days || ['mon','tue','wed','thu','fri','sat']),
+      ]
+    );
+    clearConfigCache();
+    return reply.status(201).send(res.rows[0]);
+  });
+
   fastify.put('/api/v1/routing-config/:id', { preHandler: fastify.auth }, async (request) => {
     const { id } = request.params;
     const b = request.body || {};
