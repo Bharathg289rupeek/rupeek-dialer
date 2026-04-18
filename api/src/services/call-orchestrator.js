@@ -14,20 +14,31 @@ function exotelAuth() {
 }
 
 /**
- * Trigger outbound call for a lead (agent-first flow).
- * Exotel dials RMs first via parallel ringing using the flow.
+ * Trigger outbound call for a lead (CX-first flow).
+ *
+ * Flow:
+ *   1. Exotel dials CUSTOMER first (To = customer phone)
+ *   2. Customer picks up -> Voicebot greets: "Hi, regarding your gold loan enquiry..."
+ *   3. Passthru applet -> our API checks lead validity + business hours
+ *   4. Connect applet -> our API returns RM numbers with parallel_ringing
+ *   5. All RMs dialed simultaneously -> first to pick gets bridged to customer
+ *   6. No RM picks -> fallback to call center
+ *
+ * Retries:
+ *   - Customer doesn't pick -> retry 2 times (10 min apart), then UTM
+ *   - Customer picks but no RM answers -> retry 3 times (10 min apart), then UTM
  */
 export async function triggerOutboundCall(lead, attemptNumber = 1) {
   const routing = await findRMsForLead(lead);
   const config = await getRoutingConfig();
 
   if (routing.agents.length === 0) {
-    // No agents found → immediate call center fallback
     await logCall(lead.lead_id, {
-      call_type: 'outbound_rm',
+      call_type: 'outbound_cx',
       disposition: 'RM_NO_ANSWER_CALLCENTER',
       attempt_number: attemptNumber,
       rm_phones_dialed: [],
+      to_number: formatPhone(lead.customer_phone),
       metadata: { reason: 'no_agents_mapped', matched_level: null },
     });
     return { success: false, reason: 'no_agents_mapped', fallback: 'call_center' };
@@ -35,20 +46,20 @@ export async function triggerOutboundCall(lead, attemptNumber = 1) {
 
   const rmPhones = routing.agents.map(a => formatPhone(a.agent_phone));
 
-  // Store RM numbers for Connect dynamic URL endpoint to serve
   await query(
     `UPDATE leads SET status = 'in_progress', updated_at = NOW() WHERE lead_id = $1`,
     [lead.lead_id]
   );
 
-  // Store pending call data so /exotel/connect can serve RM numbers
+  // Log call initiation - store RM phones so /exotel/connect can serve them
   await query(
-    `INSERT INTO call_logs (lead_id, call_type, direction, from_number, exophone, attempt_number, rm_phones_dialed, disposition, metadata)
-     VALUES ($1, 'outbound_rm', 'outbound', $2, $2, $3, $4, 'INITIATED', $5)
+    `INSERT INTO call_logs (lead_id, call_type, direction, from_number, to_number, exophone, attempt_number, rm_phones_dialed, disposition, metadata)
+     VALUES ($1, 'outbound_cx', 'outbound', $2, $3, $2, $4, $5, 'INITIATED', $6)
      RETURNING id`,
     [
       lead.lead_id,
       EXOPHONE(),
+      formatPhone(lead.customer_phone),
       attemptNumber,
       JSON.stringify(rmPhones),
       JSON.stringify({
@@ -58,8 +69,7 @@ export async function triggerOutboundCall(lead, attemptNumber = 1) {
     ]
   );
 
-  // Call Exotel Click-to-Call API
-  // The flow is configured so: RM hears greeting → Passthru checks lead → Connect fetches RM numbers → parallel ring
+  // CX-first: Exotel dials customer -> voicebot greeting -> passthru -> connect dials RMs
   try {
     const sid = EXOTEL_SID();
     const url = `${EXOTEL_BASE()}/Accounts/${sid}/Calls/connect`;
@@ -67,9 +77,9 @@ export async function triggerOutboundCall(lead, attemptNumber = 1) {
 
     const body = new URLSearchParams({
       From: EXOPHONE(),
-      To: formatPhone(lead.customer_phone),
+      To: formatPhone(lead.customer_phone),   // CX-first: customer dialed first
       CallerId: EXOPHONE(),
-      Url: process.env.EXOTEL_APP_URL,
+      Url: process.env.EXOTEL_APP_URL,        // Flow: Voicebot -> Passthru -> Connect (RM dial)
       CustomField: lead.lead_id,
       StatusCallback: `${apiBase}/api/v1/exotel/status-callback`,
     });
@@ -86,7 +96,6 @@ export async function triggerOutboundCall(lead, attemptNumber = 1) {
     const data = await response.json();
 
     if (response.ok) {
-      // Update call log with CallSid
       const callSid = data?.Call?.Sid || data?.call?.sid || null;
       if (callSid) {
         await query(
@@ -97,20 +106,22 @@ export async function triggerOutboundCall(lead, attemptNumber = 1) {
       return { success: true, call_sid: callSid, agents: routing.agents };
     } else {
       await logCall(lead.lead_id, {
-        call_type: 'outbound_rm',
+        call_type: 'outbound_cx',
         disposition: 'CALL_FAILED',
         attempt_number: attemptNumber,
         rm_phones_dialed: rmPhones,
+        to_number: formatPhone(lead.customer_phone),
         metadata: { error: data, http_status: response.status },
       });
       return { success: false, reason: 'exotel_api_error', error: data };
     }
   } catch (err) {
     await logCall(lead.lead_id, {
-      call_type: 'outbound_rm',
+      call_type: 'outbound_cx',
       disposition: 'CALL_FAILED',
       attempt_number: attemptNumber,
       rm_phones_dialed: rmPhones,
+      to_number: formatPhone(lead.customer_phone),
       metadata: { error: err.message },
     });
     return { success: false, reason: 'network_error', error: err.message };
@@ -124,7 +135,7 @@ export async function logCall(leadId, data) {
     [
       leadId,
       data.call_sid || null,
-      data.call_type || 'outbound_rm',
+      data.call_type || 'outbound_cx',
       data.direction || 'outbound',
       data.from_number || null,
       data.to_number || null,
