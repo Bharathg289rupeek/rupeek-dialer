@@ -76,8 +76,8 @@ export async function triggerOutboundCall(lead, attemptNumber = 1) {
     const apiBase = process.env.API_BASE_URL || 'http://localhost:3000';
 
     const body = new URLSearchParams({
-      From: EXOPHONE(),
-      To: formatPhone(lead.customer_phone),   // CX-first: customer dialed first
+      From: formatPhone(lead.customer_phone),
+      To: EXOPHONE(),   // CX-first: customer dialed first
       CallerId: EXOPHONE(),
       Url: process.env.EXOTEL_APP_URL,        // Flow: Voicebot -> Passthru -> Connect (RM dial)
       CustomField: lead.lead_id,
