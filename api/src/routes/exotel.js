@@ -38,7 +38,7 @@ export default async function exotelRoutes(fastify) {
 
     if (callSid) {
       await query(
-        `UPDATE call_logs SET call_sid = $1 WHERE lead_id = $2 AND call_sid IS NULL ORDER BY created_at DESC LIMIT 1`,
+        `UPDATE call_logs SET call_sid = $1 WHERE id = (SELECT id FROM call_logs WHERE lead_id = $2 AND call_sid IS NULL ORDER BY created_at DESC LIMIT 1)`,
         [callSid, leadId]
       );
     }

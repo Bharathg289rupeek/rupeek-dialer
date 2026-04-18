@@ -99,7 +99,7 @@ export async function triggerOutboundCall(lead, attemptNumber = 1) {
       const callSid = data?.Call?.Sid || data?.call?.sid || null;
       if (callSid) {
         await query(
-          `UPDATE call_logs SET call_sid = $1 WHERE lead_id = $2 AND disposition = 'INITIATED' ORDER BY created_at DESC LIMIT 1`,
+          `UPDATE call_logs SET call_sid = $1 WHERE id = (SELECT id FROM call_logs WHERE lead_id = $2 AND disposition = 'INITIATED' ORDER BY created_at DESC LIMIT 1)`,
           [callSid, lead.lead_id]
         );
       }
