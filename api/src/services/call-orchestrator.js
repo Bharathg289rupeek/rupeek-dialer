@@ -72,7 +72,7 @@ export async function triggerOutboundCall(lead, attemptNumber = 1) {
   // CX-first: Exotel dials customer -> voicebot greeting -> passthru -> connect dials RMs
   try {
     const sid = EXOTEL_SID();
-    const url = `${EXOTEL_BASE()}/Accounts/${sid}/Calls/connect`;
+    const url = `${EXOTEL_BASE()}/Accounts/${sid}/Calls/connect.json`;
     const apiBase = process.env.API_BASE_URL || 'http://localhost:3000';
 
     const body = new URLSearchParams({
