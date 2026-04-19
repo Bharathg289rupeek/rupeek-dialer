@@ -7,10 +7,12 @@ export default async function leadRoutes(fastify) {
   // Webhook: Lead ingestion from Chakra CRM (no auth — secured by webhook secret)
   fastify.post('/api/v1/leads/ingest', async (request, reply) => {
     const body = request.body || {};
-    const { lead_id, phone, name, city, pincode, branch_id, loan_type, loan_amount, lead_source } = body;
+    const { phone, name, city, pincode, branch_id, loan_type, loan_amount, lead_source } = body;
+    // Auto-generate lead_id if not provided
+    const lead_id = body.lead_id || `AUTO-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
-    if (!lead_id || !phone) {
-      return reply.status(400).send({ error: 'lead_id and phone are required' });
+    if (!phone) {
+      return reply.status(400).send({ error: 'phone is required' });
     }
 
     // Deduplicate

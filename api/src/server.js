@@ -2,6 +2,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
+import formbody from '@fastify/formbody';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -29,16 +30,11 @@ const app = Fastify({
 });
 
 // Plugins
-await app.register(cors, {
-  origin: true,
-  credentials: true,
-});
+await app.register(cors, { origin: true, credentials: true });
+await app.register(formbody);  // Parse application/x-www-form-urlencoded (Exotel callbacks)
+await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } });
 
-await app.register(multipart, {
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-});
-
-// Auth decorator — so routes can use { preHandler: fastify.auth }
+// Auth decorator
 app.decorate('auth', authMiddleware);
 
 // Health check
@@ -64,7 +60,6 @@ if (dashboardExists) {
     prefix: '/',
     wildcard: false,
   });
-  // SPA fallback: serve index.html for any non-API route
   app.setNotFoundHandler((request, reply) => {
     if (request.url.startsWith('/api/')) {
       return reply.status(404).send({ error: 'Not found' });
@@ -77,11 +72,7 @@ if (dashboardExists) {
     if (request.url.startsWith('/api/')) {
       return reply.status(404).send({ error: 'Not found' });
     }
-    return reply.status(200).send({
-      message: 'Rupeek Dialer API is running. Dashboard not built yet.',
-      health: '/health',
-      api: '/api/v1/',
-    });
+    return reply.status(200).send({ message: 'API running. Dashboard not built.' });
   });
 }
 
@@ -92,25 +83,21 @@ const host = '0.0.0.0';
 try {
   await app.listen({ port, host });
   console.log(`Server running on ${host}:${port}`);
-  console.log(`Dashboard: ${dashboardExists ? 'serving from ' + dashboardPath : 'not found (API only)'}`);
-  console.log(`Database: ${process.env.DATABASE_URL ? 'configured' : 'NOT SET — check DATABASE_URL env var'}`);
+  console.log(`Dashboard: ${dashboardExists ? 'serving' : 'not found'}`);
+  console.log(`Database: ${process.env.DATABASE_URL ? 'configured' : 'NOT SET'}`);
 
-  // Start background workers (don't crash server if workers fail)
   if (process.env.DISABLE_WORKERS !== 'true') {
     try {
       await startWorkers();
     } catch (workerErr) {
-      console.error('Workers failed to start (server still running):', workerErr.message);
-      console.error('Retries and queue processing will not work until workers are fixed.');
+      console.error('Workers failed to start:', workerErr.message);
     }
   }
 } catch (err) {
   console.error('SERVER FAILED TO START:', err.message);
-  console.error('Full error:', err);
   process.exit(1);
 }
 
-// Graceful shutdown
 const signals = ['SIGINT', 'SIGTERM'];
 for (const signal of signals) {
   process.on(signal, async () => {
