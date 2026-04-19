@@ -81,7 +81,7 @@ export async function triggerOutboundCall(lead, attemptNumber = 1) {
       CallerId: EXOPHONE(),
       Url: process.env.EXOTEL_APP_URL,        // Flow: Voicebot -> Passthru -> Connect (RM dial)
       CustomField: lead.lead_id,
-      StatusCallback: `${apiBase}/api/v1/exotel/status-callback`,
+      StatusCallback: `${apiBase}/api/v1/exotel/status-callback?CustomField=${lead.lead_id}`,
     });
 
     const response = await fetch(url, {
