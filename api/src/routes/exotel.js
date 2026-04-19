@@ -148,6 +148,13 @@ export default async function exotelRoutes(fastify) {
       }
     }
 
+    // If still no status or call still in progress — skip, let poll handle it
+    const lowerStatusCheck = status.toLowerCase();
+    if (!status || lowerStatusCheck === 'in-progress' || lowerStatusCheck === 'ringing' || lowerStatusCheck === 'queued') {
+      console.log(`[STATUS-CALLBACK] Call still ${status || 'unknown'}, skipping — poll will handle`);
+      return reply.status(200).send('OK');
+    }
+
     // Determine disposition
     let disposition = 'CALL_FAILED';
     const lowerStatus = status.toLowerCase();
@@ -247,6 +254,16 @@ export default async function exotelRoutes(fastify) {
    * Shared disposition processing — used by both StatusCallback and polling.
    */
   async function processDisposition(leadId, callSid, disposition, dialWhom, duration, recordingUrl, exotelStatus, rawData) {
+    // Dedup: skip if already processed with a real disposition
+    const existing = await query(
+      `SELECT disposition FROM call_logs WHERE lead_id = $1 AND disposition NOT IN ('INITIATED', 'CALL_FAILED') LIMIT 1`,
+      [leadId]
+    );
+    if (existing.rows.length > 0) {
+      console.log(`[PROCESS] ${leadId} already has ${existing.rows[0].disposition}, skipping duplicate`);
+      return;
+    }
+
     // Log call
     await logCall(leadId, {
       call_sid: callSid,
