@@ -143,7 +143,7 @@ export default async function exotelRoutes(fastify) {
         status = callDetails.Status || callDetails.status || '';
         duration = parseInt(callDetails.Duration || callDetails.duration || 0);
         recordingUrl = callDetails.RecordingUrl || callDetails.recording_url || '';
-        dialWhom = callDetails.DialWhomNumber || '';
+        dialWhom = dialWhom || callDetails.DialWhomNumber || '';
         console.log('[STATUS-CALLBACK] Fetched from API:', { status, duration, dialWhom });
       }
     }
@@ -155,28 +155,38 @@ export default async function exotelRoutes(fastify) {
       return reply.status(200).send('OK');
     }
 
-    // Determine disposition
+    // ── Disposition logic ────────────────────────────────────────────────
+    // Key principle: RM_CONNECTED requires BOTH DialCallStatus=completed AND a
+    // populated DialWhomNumber. Master Status=completed alone only means "call
+    // ended cleanly" — customer may have hung up during voicebot or ringback.
+    // Duration > 5s is NOT a reliable signal (voicebot + ringback can easily
+    // run 20-30s before the customer hangs up).
     let disposition = 'CALL_FAILED';
     const lowerStatus = status.toLowerCase();
     const lowerDial = dialStatus.toLowerCase();
+    const hasRmAnswered = dialWhom && dialWhom.trim() !== '';
 
-    if (lowerStatus === 'no-answer') {
-      disposition = 'CUSTOMER_NOT_PICKED';
-    } else if (lowerStatus === 'busy') {
+    if (lowerDial === 'completed' && hasRmAnswered) {
+      // RM leg completed AND we know which RM — genuine connection
+      disposition = 'RM_CONNECTED';
+    } else if (lowerDial === 'no-answer' || lowerDial === 'busy') {
+      // RM leg attempted but nobody answered
+      disposition = 'RM_NO_ANSWER';
+    } else if (lowerDial === 'canceled') {
+      // RM leg cancelled — typically customer hung up during ringback
+      disposition = 'CX_DROP_VOICEBOT';
+    } else if (lowerStatus === 'no-answer' || lowerStatus === 'busy') {
+      // Customer leg never answered
       disposition = 'CUSTOMER_NOT_PICKED';
     } else if (lowerStatus === 'canceled') {
       disposition = 'CX_DROP_VOICEBOT';
-    } else if (lowerStatus === 'completed' && duration > 5) {
-      disposition = 'RM_CONNECTED';
-    } else if (lowerStatus === 'completed' && duration <= 5) {
-      disposition = 'RM_NO_ANSWER';
-    } else if (lowerDial === 'completed' && duration > 5) {
-      disposition = 'RM_CONNECTED';
-    } else if (lowerDial === 'no-answer' || lowerDial === 'busy') {
-      disposition = 'RM_NO_ANSWER';
+    } else if (lowerStatus === 'completed') {
+      // Master status completed but no DialCallStatus evidence of RM connect —
+      // customer most likely hung up during voicebot greeting
+      disposition = hasRmAnswered ? 'RM_CONNECTED' : 'CX_DROP_VOICEBOT';
     }
 
-    console.log(`[STATUS-CALLBACK] Lead: ${leadId}, Status: ${status}, Disposition: ${disposition}, Duration: ${duration}, DialWhom: ${dialWhom}`);
+    console.log(`[STATUS-CALLBACK] Lead: ${leadId}, Status: ${status}, DialStatus: ${dialStatus}, DialWhom: ${dialWhom || '(empty)'}, Duration: ${duration}, → Disposition: ${disposition}`);
 
     await processDisposition(leadId, callSid, disposition, dialWhom, duration, recordingUrl, status, { source: 'status-callback', raw: data });
 
@@ -216,22 +226,9 @@ export default async function exotelRoutes(fastify) {
         return;
       }
 
-      let disposition = 'CALL_FAILED';
-      if (status === 'completed' && duration > 5) {
-        disposition = 'RM_CONNECTED';
-      } else if (status === 'completed' && duration <= 5) {
-        disposition = 'RM_NO_ANSWER';
-      } else if (status === 'no-answer') {
-        disposition = 'CUSTOMER_NOT_PICKED';
-      } else if (status === 'busy') {
-        disposition = 'CUSTOMER_NOT_PICKED';
-      } else if (status === 'canceled') {
-        disposition = 'CX_DROP_VOICEBOT';
-      }
-
-      console.log(`[POLL] Lead: ${leadId}, Status: ${status}, Disposition: ${disposition}, Duration: ${duration}`);
-
-      // Find DialWhomNumber from call legs if available (best-effort, usually empty for master call)
+      // Try to find which RM answered (best-effort).
+      // For parallel_ringing calls, the master /Calls/{sid}.json endpoint
+      // usually does NOT include leg-level info, so this is often empty.
       let dialWhom = '';
       if (callDetails.Legs || callDetails.legs) {
         const legs = callDetails.Legs || callDetails.legs;
@@ -242,10 +239,27 @@ export default async function exotelRoutes(fastify) {
           }
         }
       }
-      // Also try DialWhomNumber on master call (usually null for parallel dial, but free to try)
       if (!dialWhom) {
         dialWhom = callDetails.DialWhomNumber || callDetails.dialwhomnumber || '';
       }
+
+      const hasRmAnswered = dialWhom && dialWhom.trim() !== '';
+
+      // Disposition — poll is best-effort fallback. Same principle:
+      // completed status WITHOUT a known RM is treated as customer drop.
+      let disposition = 'CALL_FAILED';
+      if (status === 'completed' && hasRmAnswered) {
+        disposition = 'RM_CONNECTED';
+      } else if (status === 'completed') {
+        // Call ended cleanly but we couldn't identify an RM — customer drop
+        disposition = 'CX_DROP_VOICEBOT';
+      } else if (status === 'no-answer' || status === 'busy') {
+        disposition = 'CUSTOMER_NOT_PICKED';
+      } else if (status === 'canceled') {
+        disposition = 'CX_DROP_VOICEBOT';
+      }
+
+      console.log(`[POLL] Lead: ${leadId}, Status: ${status}, DialWhom: ${dialWhom || '(empty)'}, Duration: ${duration}, → Disposition: ${disposition}`);
 
       await processDisposition(leadId, callSid, disposition, dialWhom, duration, recordingUrl, status, { source: 'poll' });
 
