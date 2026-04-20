@@ -108,7 +108,7 @@ export default async function exotelRoutes(fastify) {
       max_ringing_duration: config?.rm_ring_duration_sec || 20,
       record: true,
       recording_channels: 'dual',
-      fetch_after_attempt: false,
+      fetch_after_attempt: true,
     };
   });
 
@@ -176,9 +176,9 @@ export default async function exotelRoutes(fastify) {
       disposition = 'RM_NO_ANSWER';
     }
 
-    console.log(`[STATUS-CALLBACK] Lead: ${leadId}, Status: ${status}, Disposition: ${disposition}, Duration: ${duration}`);
+    console.log(`[STATUS-CALLBACK] Lead: ${leadId}, Status: ${status}, Disposition: ${disposition}, Duration: ${duration}, DialWhom: ${dialWhom}`);
 
-    await processDisposition(leadId, callSid, disposition, dialWhom, duration, recordingUrl, status, data);
+    await processDisposition(leadId, callSid, disposition, dialWhom, duration, recordingUrl, status, { source: 'status-callback', raw: data });
 
     return reply.status(200).send('OK');
   });
@@ -231,7 +231,7 @@ export default async function exotelRoutes(fastify) {
 
       console.log(`[POLL] Lead: ${leadId}, Status: ${status}, Disposition: ${disposition}, Duration: ${duration}`);
 
-      // Find DialWhomNumber from call legs if available
+      // Find DialWhomNumber from call legs if available (best-effort, usually empty for master call)
       let dialWhom = '';
       if (callDetails.Legs || callDetails.legs) {
         const legs = callDetails.Legs || callDetails.legs;
@@ -241,6 +241,10 @@ export default async function exotelRoutes(fastify) {
             dialWhom = answeredLeg.To || answeredLeg.to || '';
           }
         }
+      }
+      // Also try DialWhomNumber on master call (usually null for parallel dial, but free to try)
+      if (!dialWhom) {
+        dialWhom = callDetails.DialWhomNumber || callDetails.dialwhomnumber || '';
       }
 
       await processDisposition(leadId, callSid, disposition, dialWhom, duration, recordingUrl, status, { source: 'poll' });
@@ -252,6 +256,8 @@ export default async function exotelRoutes(fastify) {
 
   /**
    * Shared disposition processing — used by both StatusCallback and polling.
+   * Single-write path: UPDATEs the INITIATED row in place, or INSERTs if missing.
+   * Captures rm_who_answered + assigned_rm_name on RM_CONNECTED.
    */
   async function processDisposition(leadId, callSid, disposition, dialWhom, duration, recordingUrl, exotelStatus, rawData) {
     // Dedup: skip if already processed with a real disposition
@@ -264,26 +270,61 @@ export default async function exotelRoutes(fastify) {
       return;
     }
 
-    // Log call
-    await logCall(leadId, {
-      call_sid: callSid,
-      call_type: 'outbound_cx',
-      direction: 'outbound',
-      to_number: dialWhom,
-      disposition,
-      rm_who_answered: disposition === 'RM_CONNECTED' ? dialWhom : null,
-      call_duration_sec: duration,
-      recording_url: recordingUrl,
-      exotel_status: exotelStatus,
-      metadata: rawData,
-    });
+    // Normalize RM phone and look up RM name if we have a phone
+    const normalizedRm = disposition === 'RM_CONNECTED' && dialWhom ? formatPhone(dialWhom) : null;
+    let rmName = null;
+    if (normalizedRm) {
+      const r = await query(
+        `SELECT agent_name FROM agents WHERE agent_phone = $1 AND is_active = true LIMIT 1`,
+        [normalizedRm]
+      );
+      rmName = r.rows[0]?.agent_name || null;
+    }
 
-    // Update INITIATED entry
-    await query(
-      `UPDATE call_logs SET disposition = $1, call_sid = $2, exotel_status = $3, call_duration_sec = $4, rm_who_answered = $5, recording_url = $6
-       WHERE id = (SELECT id FROM call_logs WHERE lead_id = $7 AND disposition = 'INITIATED' ORDER BY created_at DESC LIMIT 1)`,
-      [disposition, callSid, exotelStatus, duration, disposition === 'RM_CONNECTED' ? dialWhom : null, recordingUrl, leadId]
+    // SINGLE WRITE PATH: update the existing INITIATED row in place
+    const updateRes = await query(
+      `UPDATE call_logs
+         SET disposition = $1,
+             call_sid = COALESCE(call_sid, $2),
+             exotel_status = $3,
+             call_duration_sec = $4,
+             rm_who_answered = $5,
+             recording_url = $6,
+             to_number = COALESCE(to_number, $7),
+             metadata = COALESCE(metadata, '{}'::jsonb) || $8::jsonb
+       WHERE id = (SELECT id FROM call_logs
+                   WHERE lead_id = $9 AND disposition = 'INITIATED'
+                   ORDER BY created_at DESC LIMIT 1)
+       RETURNING id`,
+      [
+        disposition,
+        callSid,
+        exotelStatus,
+        duration,
+        normalizedRm,
+        recordingUrl,
+        normalizedRm,
+        JSON.stringify({ source: rawData?.source || 'callback', raw: rawData }),
+        leadId,
+      ]
     );
+
+    // Defensive fallback: no INITIATED row found (should not happen, but don't lose the call)
+    if (updateRes.rowCount === 0) {
+      console.warn(`[PROCESS] No INITIATED row for ${leadId}, inserting fresh`);
+      await logCall(leadId, {
+        call_sid: callSid,
+        call_type: 'outbound_cx',
+        direction: 'outbound',
+        to_number: normalizedRm,
+        disposition,
+        rm_who_answered: normalizedRm,
+        call_duration_sec: duration,
+        recording_url: recordingUrl,
+        exotel_status: exotelStatus,
+        metadata: { source: rawData?.source || 'callback_no_init', raw: rawData },
+      });
+    }
 
     // Get lead data
     const leadRes = await query(`SELECT * FROM leads WHERE lead_id = $1`, [leadId]);
@@ -298,10 +339,16 @@ export default async function exotelRoutes(fastify) {
 
     if (disposition === 'RM_CONNECTED') {
       await query(
-        `UPDATE leads SET status = 'connected', assigned_rm_phone = $2, connected_at = NOW(), updated_at = NOW() WHERE lead_id = $1`,
-        [leadId, dialWhom]
+        `UPDATE leads
+           SET status = 'connected',
+               assigned_rm_phone = $2,
+               assigned_rm_name = $3,
+               connected_at = NOW(),
+               updated_at = NOW()
+         WHERE lead_id = $1`,
+        [leadId, normalizedRm, rmName]
       );
-      if (lead) await triggerWhatsAppNotification(lead, disposition, { call_sid: callSid, rm_who_answered: dialWhom, call_duration_sec: duration, attempt_number: attemptCount });
+      if (lead) await triggerWhatsAppNotification(lead, disposition, { call_sid: callSid, rm_who_answered: normalizedRm, call_duration_sec: duration, attempt_number: attemptCount });
 
     } else if (disposition === 'CUSTOMER_NOT_PICKED' || disposition === 'CX_DROP_VOICEBOT') {
       if (attemptCount < 2) {
@@ -376,7 +423,7 @@ export default async function exotelRoutes(fastify) {
       destination: { numbers },
       parallel_ringing: { activate: numbers.length > 1, max_parallel_attempts: Math.min(numbers.length, 3) },
       max_ringing_duration: config?.rm_ring_duration_sec || 20,
-      record: true, recording_channels: 'dual', fetch_after_attempt: false,
+      record: true, recording_channels: 'dual', fetch_after_attempt: true,
     };
   });
 }
