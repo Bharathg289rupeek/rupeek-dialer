@@ -358,9 +358,10 @@ export default async function exotelRoutes(fastify) {
            WHERE id = (SELECT id FROM call_logs WHERE lead_id = $2 AND call_sid IS NULL ORDER BY created_at DESC LIMIT 1)`,
         [callSid, leadId]
       );
-      // Fast-path polls. Durable backup lives in services/call-resolver.js.
-      setTimeout(() => pollCallStatus(callSid, leadId), 45000);
-      setTimeout(() => pollCallStatus(callSid, leadId), 90000);
+      // Classification is handled asynchronously by the stuck-call resolver
+      // (services/call-resolver.js) once the INITIATED row is ≥3 minutes old.
+      // We intentionally don't classify synchronously — Exotel's Call Details
+      // API is eventually-consistent and mis-classifies when queried too early.
     }
 
     return reply.status(200).send('OK');
@@ -417,7 +418,20 @@ export default async function exotelRoutes(fastify) {
     };
   });
 
-  // Status Callback — Exotel POSTs here after call ends
+  // Status Callback — Exotel POSTs here after call ends.
+  //
+  // ARCHITECTURE NOTE:
+  // We deliberately do NOT classify dispositions here. Exotel's Call Details
+  // API is eventually-consistent — Leg2Status and ConversationDuration aren't
+  // reliably populated for 1-3 minutes after the call ends. Classifying
+  // synchronously from the callback leads to false positives (Test-28, -29,
+  // -30 all misclassified in prior versions).
+  //
+  // Instead: this handler just records that the callback arrived (and
+  // captures CallSid / RecordingUrl opportunistically), returns 200 fast so
+  // Exotel doesn't retry, and lets services/call-resolver.js — which runs
+  // every minute and only picks up rows that have been INITIATED for 3+
+  // minutes — do the classification against a settled Exotel response.
   fastify.all('/api/v1/exotel/status-callback', async (request, reply) => {
     const data = { ...request.query, ...request.body };
     console.log('[STATUS-CALLBACK] raw query:', JSON.stringify(request.query));
@@ -426,94 +440,45 @@ export default async function exotelRoutes(fastify) {
 
     const callSid = data.CallSid || data.callsid || data.Sid || '';
     const leadId = data.CustomField || data.customfield || '';
+    const recordingUrl = data.RecordingUrl || data.recordingurl || '';
 
     if (!leadId) {
       console.log('[STATUS-CALLBACK] No CustomField, ignoring');
       return reply.status(200).send('OK');
     }
 
-    let status = data.Status || data.status || '';
-    let dialStatus = data.DialCallStatus || data.dialcallstatus || '';
-    let dialWhom = data.DialWhomNumber || data.dialwhomnumber || '';
-    let duration = parseInt(data.Duration || data.duration || data.DialCallDuration || 0);
-    let recordingUrl = data.RecordingUrl || data.recordingurl || '';
-    const rawMessage = data.Message || data.message || data.ErrorMessage || '';
-
-    // Fetch from Exotel API if:
-    //   (a) status is missing entirely, OR
-    //   (b) status=completed but neither DialCallStatus nor DialWhomNumber is
-    //       present — Exotel's master callback on this account often sends
-    //       only {CallSid, Status, DateUpdated}, hiding the RM attribution.
-    const bodyIsBare = status && !dialStatus && !dialWhom;
-    if ((!status || bodyIsBare) && callSid) {
-      console.log(`[STATUS-CALLBACK] ${!status ? 'Empty status' : 'Bare body'}, fetching from Exotel API for ${callSid}`);
-      const callDetails = await fetchExotelCallDetails(callSid);
-      if (callDetails) {
-        status = callDetails.Status || callDetails.status || status;
-        duration = parseInt(callDetails.Duration || callDetails.duration || duration);
-        recordingUrl = callDetails.RecordingUrl || callDetails.recording_url || recordingUrl;
-        const extracted = extractRmFromCallDetails(callDetails);
-        if (!dialWhom)   dialWhom = extracted.dialWhom;
-        if (!dialStatus) dialStatus = extracted.dialStatus;
-        console.log('[STATUS-CALLBACK] Fetched from API:', { status, duration, dialStatus, dialWhom, convDur: extracted.conversationDuration });
+    // Opportunistic capture: if we received CallSid or RecordingUrl and the
+    // INITIATED row doesn't yet have them, store them so the resolver finds
+    // them later. Never classify here.
+    if (callSid || recordingUrl) {
+      const sets = [];
+      const params = [];
+      let idx = 1;
+      if (callSid) {
+        sets.push(`call_sid = COALESCE(call_sid, $${idx++})`);
+        params.push(callSid);
+      }
+      if (recordingUrl) {
+        sets.push(`recording_url = COALESCE(recording_url, $${idx++})`);
+        params.push(recordingUrl);
+      }
+      params.push(leadId);
+      try {
+        await query(
+          `UPDATE call_logs SET ${sets.join(', ')}
+             WHERE id = (SELECT id FROM call_logs
+                          WHERE lead_id = $${idx} AND disposition = 'INITIATED'
+                          ORDER BY created_at DESC LIMIT 1)`,
+          params
+        );
+      } catch (err) {
+        console.error('[STATUS-CALLBACK] capture error:', err.message);
       }
     }
 
-    const lowerStatusCheck = status.toLowerCase();
-    if (!status || lowerStatusCheck === 'in-progress' || lowerStatusCheck === 'ringing' || lowerStatusCheck === 'queued') {
-      console.log(`[STATUS-CALLBACK] Still ${status || 'unknown'} — letting resolver handle`);
-      return reply.status(200).send('OK');
-    }
-
-    const normalizedDialWhom = dialWhom ? formatPhone(dialWhom) : '';
-    const disposition = classifyDisposition({
-      status, dialStatus, dialWhom: normalizedDialWhom, duration, rawMessage,
-    });
-
-    console.log(`[STATUS-CALLBACK] Lead=${leadId} Status=${status} DialStatus=${dialStatus} DialWhom=${normalizedDialWhom || '-'} Dur=${duration} → ${disposition}`);
-
-    await processDisposition(leadId, callSid, disposition, normalizedDialWhom, duration, recordingUrl, status, { source: 'status-callback', raw: data });
-
+    console.log(`[STATUS-CALLBACK] ${leadId} callback received (classification deferred to resolver)`);
     return reply.status(200).send('OK');
   });
-
-  // Fast-path in-process poll
-  async function pollCallStatus(callSid, leadId) {
-    try {
-      const existing = await query(
-        `SELECT disposition FROM call_logs WHERE lead_id = $1 AND disposition NOT IN ('INITIATED') LIMIT 1`,
-        [leadId]
-      );
-      if (existing.rows.length > 0) {
-        console.log(`[POLL] ${leadId} already has ${existing.rows[0].disposition}, skipping`);
-        return;
-      }
-
-      const callDetails = await fetchExotelCallDetails(callSid);
-      if (!callDetails) return;
-
-      const status = (callDetails.Status || callDetails.status || '').toLowerCase();
-      const duration = parseInt(callDetails.Duration || callDetails.duration || 0);
-      const recordingUrl = callDetails.RecordingUrl || callDetails.recording_url || '';
-
-      if (status === 'in-progress' || status === 'ringing' || status === 'queued') {
-        console.log(`[POLL] ${callSid} still ${status}`);
-        return;
-      }
-
-      const { dialWhom, dialStatus, conversationDuration } = extractRmFromCallDetails(callDetails);
-      const normalizedDialWhom = dialWhom ? formatPhone(dialWhom) : '';
-      const disposition = classifyDisposition({
-        status, dialStatus, dialWhom: normalizedDialWhom, duration, rawMessage: '',
-      });
-
-      console.log(`[POLL] Lead=${leadId} Status=${status} DialStatus=${dialStatus || '-'} DialWhom=${normalizedDialWhom || '-'} Dur=${duration}/${conversationDuration}s → ${disposition}`);
-      await processDisposition(leadId, callSid, disposition, normalizedDialWhom, duration, recordingUrl, status, { source: 'poll' });
-
-    } catch (err) {
-      console.error(`[POLL] Error polling ${callSid}:`, err.message);
-    }
-  }
 
   // Inbound passthru
   fastify.all('/api/v1/exotel/inbound-passthru', async (request, reply) => {

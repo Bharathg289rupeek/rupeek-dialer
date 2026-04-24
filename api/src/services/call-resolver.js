@@ -5,14 +5,21 @@ import { classifyDisposition, processDisposition, extractRmFromCallDetails } fro
 /**
  * Stuck-call resolver. Runs every minute via pg-boss.
  *
- * Exotel's StatusCallback is unreliable on this account (often arrives with
- * empty/multipart bodies). The in-process setTimeout polls in exotel.js do
- * not survive server restarts. This cron is the durable backstop.
+ * ARCHITECTURE:
+ * This is the ONLY path that classifies dispositions in the normal flow.
+ * The status-callback handler just records the fact that Exotel fired, and
+ * the resolver (running on a cron) does the actual classification against
+ * Exotel's settled Call Details response.
  *
- * Picks call_logs rows stuck at INITIATED for > 60s, polls Exotel's
- * Call Details API, runs them through the same classifier + pipeline as the
- * HTTP handler. After 10 minutes stuck with no Exotel data, abandons to
- * CALL_FAILED so leads don't hang forever.
+ * WHY THE 3-MINUTE DELAY:
+ * Exotel's Call Details API is eventually-consistent. The Leg2Status and
+ * ConversationDuration fields take 1-3 minutes to populate post-call. If
+ * we classify earlier, we get false RM_CONNECTED for customer-hangup calls
+ * (Call.To contains the Exophone instead of an RM).
+ *
+ * SAFETY VALVE:
+ * After 10 minutes stuck with no settled Exotel data, we abandon to
+ * CALL_FAILED so leads never hang forever.
  */
 export async function resolveStuckCalls() {
   const stuckRes = await query(
@@ -20,7 +27,7 @@ export async function resolveStuckCalls() {
        FROM call_logs
       WHERE disposition = 'INITIATED'
         AND call_sid IS NOT NULL
-        AND created_at < NOW() - INTERVAL '60 seconds'
+        AND created_at < NOW() - INTERVAL '180 seconds'
       ORDER BY created_at ASC
       LIMIT 20`
   );

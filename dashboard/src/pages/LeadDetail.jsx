@@ -42,10 +42,24 @@ export default function LeadDetail() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api.get(`/api/v1/leads/${leadId}`)
+    const load = () => api.get(`/api/v1/leads/${leadId}`)
       .then(setData)
       .catch(console.error)
       .finally(() => setLoading(false));
+
+    load();
+    // Auto-refresh every 15s while any call is INITIATED — the resolver runs
+    // every minute, so the page will reflect the terminal state within ~3.5 min
+    // of the call ending.
+    const interval = setInterval(() => {
+      if (data?.calls?.some(c => c.disposition === 'INITIATED') ||
+          data?.lead?.status === 'in_progress' ||
+          data?.lead?.status === 'cx_notpicked_retrying') {
+        load();
+      }
+    }, 15000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leadId]);
 
   if (loading) return <div className="flex justify-center py-16"><div className="animate-spin rounded-full h-8 w-8 border-2 border-brand-600 border-t-transparent" /></div>;
@@ -101,6 +115,15 @@ export default function LeadDetail() {
         </div>
 
         {/* Contextual banners */}
+        {lead.status === 'in_progress' && calls.some(c => c.disposition === 'INITIATED') && (
+          <div className="mt-4 p-3 bg-blue-50 border border-blue-100 rounded-lg text-xs text-blue-700 flex items-start gap-2">
+            <div className="animate-spin rounded-full h-3 w-3 border-2 border-blue-600 border-t-transparent mt-0.5 shrink-0" />
+            <div>
+              <strong>Call in progress.</strong> Classification is deferred by up to 3 minutes
+              while Exotel finalises the call details. This page refreshes automatically.
+            </div>
+          </div>
+        )}
         {lead.status === 'call_center_handled' && (
           <div className="mt-4 p-3 bg-purple-50 border border-purple-100 rounded-lg text-xs text-purple-700">
             <strong>Routed to call centre.</strong> No RM picked up within the ring window;
