@@ -1,6 +1,6 @@
 import { query } from '../db/connection.js';
 import { formatPhone } from '../utils/business-hours.js';
-import { classifyDisposition, processDisposition } from '../routes/exotel.js';
+import { classifyDisposition, processDisposition, extractRmFromCallDetails } from '../routes/exotel.js';
 
 /**
  * Stuck-call resolver. Runs every minute via pg-boss.
@@ -58,24 +58,14 @@ export async function resolveStuckCalls() {
       const duration = parseInt(details.Duration || details.duration || 0);
       const recordingUrl = details.RecordingUrl || details.recording_url || '';
 
-      // Best-effort RM phone extraction
-      let dialWhom = '';
-      if (details.Legs || details.legs) {
-        const legs = details.Legs || details.legs;
-        if (Array.isArray(legs) && legs.length > 0) {
-          const answeredLeg = legs.find(l => (l.Status || l.status || '').toLowerCase() === 'completed');
-          if (answeredLeg) dialWhom = answeredLeg.To || answeredLeg.to || '';
-        }
-      }
-      if (!dialWhom) dialWhom = details.DialWhomNumber || details.dialwhomnumber || '';
-
+      const { dialWhom, dialStatus, conversationDuration } = extractRmFromCallDetails(details);
       const normalizedDialWhom = dialWhom ? formatPhone(dialWhom) : '';
 
       const disposition = classifyDisposition({
-        status, dialStatus: '', dialWhom: normalizedDialWhom, duration, rawMessage: '',
+        status, dialStatus, dialWhom: normalizedDialWhom, duration, rawMessage: '',
       });
 
-      console.log(`[RESOLVER] ${row.lead_id} (${row.call_sid}): status=${status} dialWhom=${normalizedDialWhom || '-'} → ${disposition}`);
+      console.log(`[RESOLVER] ${row.lead_id} (${row.call_sid}): status=${status} dialStatus=${dialStatus || '-'} dialWhom=${normalizedDialWhom || '-'} dur=${duration}/${conversationDuration}s → ${disposition}`);
 
       await processDisposition(
         row.lead_id, row.call_sid, disposition,
@@ -100,7 +90,7 @@ async function fetchExotelCallDetailsLocal(callSid) {
   const key = process.env.EXOTEL_API_KEY;
   const token = process.env.EXOTEL_API_TOKEN;
   const base = process.env.EXOTEL_API_BASE || 'https://api.exotel.com/v1';
-  const url = `${base}/Accounts/${sid}/Calls/${callSid}.json`;
+  const url = `${base}/Accounts/${sid}/Calls/${callSid}.json?details=true`;
   try {
     const res = await fetch(url, {
       headers: { 'Authorization': 'Basic ' + Buffer.from(`${key}:${token}`).toString('base64') },
@@ -109,6 +99,7 @@ async function fetchExotelCallDetailsLocal(callSid) {
       const data = await res.json();
       return data?.Call || data?.call || data;
     }
+    console.warn(`[RESOLVER] Exotel fetch HTTP ${res.status} for ${callSid}`);
     return null;
   } catch (err) {
     console.error('[RESOLVER] Exotel fetch error:', err.message);

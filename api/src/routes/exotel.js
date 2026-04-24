@@ -13,7 +13,9 @@ async function fetchExotelCallDetails(callSid) {
   const key = process.env.EXOTEL_API_KEY;
   const token = process.env.EXOTEL_API_TOKEN;
   const base = process.env.EXOTEL_API_BASE || 'https://api.exotel.com/v1';
-  const url = `${base}/Accounts/${sid}/Calls/${callSid}.json`;
+  // details=true adds ConversationDuration, Leg1Status, Leg2Status — useful
+  // for distinguishing "RM answered" from "customer hung up during voicebot".
+  const url = `${base}/Accounts/${sid}/Calls/${callSid}.json?details=true`;
   try {
     const res = await fetch(url, {
       headers: { 'Authorization': 'Basic ' + Buffer.from(`${key}:${token}`).toString('base64') },
@@ -22,11 +24,57 @@ async function fetchExotelCallDetails(callSid) {
       const data = await res.json();
       return data?.Call || data?.call || data;
     }
+    console.warn(`[EXOTEL-FETCH] HTTP ${res.status} for ${callSid}`);
     return null;
   } catch (err) {
     console.error('[EXOTEL-FETCH] Error:', err.message);
     return null;
   }
+}
+
+/**
+ * Extract RM phone + synthetic dial status from an Exotel Call Details response.
+ *
+ * Exotel's behaviour on this account (confirmed by live inspection):
+ *   - For a connect-applet outbound call, Exotel rewrites the master `To`
+ *     field to the number that actually answered after the call completes.
+ *   - So when Status=completed, `Call.To` is the RM who picked up.
+ *   - `Details.Leg2Status` tells us whether the RM leg succeeded.
+ *   - `Details.ConversationDuration` is actual talk time (in seconds).
+ *
+ * Returns { dialWhom, dialStatus, conversationDuration } — callers use these
+ * instead of the raw callback fields when the callback body is bare.
+ */
+export function extractRmFromCallDetails(callDetails) {
+  if (!callDetails) return { dialWhom: '', dialStatus: '', conversationDuration: 0 };
+
+  // Primary source: the rewritten `To` field on a completed outbound call.
+  // If From == To, we're looking at an edge case (self-dial?); skip it.
+  let dialWhom = '';
+  const to = callDetails.To || callDetails.to || '';
+  const from = callDetails.From || callDetails.from || '';
+  const direction = (callDetails.Direction || callDetails.direction || '').toLowerCase();
+  const status = (callDetails.Status || callDetails.status || '').toLowerCase();
+
+  if (status === 'completed' && to && to !== from && direction.startsWith('outbound')) {
+    dialWhom = to;
+  }
+
+  // Fallback to documented fields in case Exotel changes behaviour
+  if (!dialWhom) dialWhom = callDetails.DialWhomNumber || callDetails.dialwhomnumber || '';
+
+  // Leg2Status on a connect-applet call reflects the RM-leg outcome.
+  // Leg1 is the customer leg. If Leg2 is completed, an RM answered.
+  const details = callDetails.Details || callDetails.details || {};
+  const leg2Status = details.Leg2Status || details.leg2Status || '';
+  const conversationDuration = parseInt(details.ConversationDuration || details.conversationDuration || 0);
+
+  // Synthesize a DialCallStatus from Leg2Status so the classifier can treat
+  // this the same as a direct status-callback that did have DialCallStatus.
+  let dialStatus = '';
+  if (leg2Status) dialStatus = leg2Status.toLowerCase();
+
+  return { dialWhom, dialStatus, conversationDuration };
 }
 
 function isExotelCallCenter(normalizedPhone) {
@@ -378,15 +426,23 @@ export default async function exotelRoutes(fastify) {
     let recordingUrl = data.RecordingUrl || data.recordingurl || '';
     const rawMessage = data.Message || data.message || data.ErrorMessage || '';
 
-    if (!status && callSid) {
-      console.log('[STATUS-CALLBACK] Empty status, fetching from Exotel API');
+    // Fetch from Exotel API if:
+    //   (a) status is missing entirely, OR
+    //   (b) status=completed but neither DialCallStatus nor DialWhomNumber is
+    //       present — Exotel's master callback on this account often sends
+    //       only {CallSid, Status, DateUpdated}, hiding the RM attribution.
+    const bodyIsBare = status && !dialStatus && !dialWhom;
+    if ((!status || bodyIsBare) && callSid) {
+      console.log(`[STATUS-CALLBACK] ${!status ? 'Empty status' : 'Bare body'}, fetching from Exotel API for ${callSid}`);
       const callDetails = await fetchExotelCallDetails(callSid);
       if (callDetails) {
-        status = callDetails.Status || callDetails.status || '';
-        duration = parseInt(callDetails.Duration || callDetails.duration || 0);
-        recordingUrl = callDetails.RecordingUrl || callDetails.recording_url || '';
-        dialWhom = dialWhom || callDetails.DialWhomNumber || '';
-        console.log('[STATUS-CALLBACK] Fetched from API:', { status, duration, dialWhom });
+        status = callDetails.Status || callDetails.status || status;
+        duration = parseInt(callDetails.Duration || callDetails.duration || duration);
+        recordingUrl = callDetails.RecordingUrl || callDetails.recording_url || recordingUrl;
+        const extracted = extractRmFromCallDetails(callDetails);
+        if (!dialWhom)   dialWhom = extracted.dialWhom;
+        if (!dialStatus) dialStatus = extracted.dialStatus;
+        console.log('[STATUS-CALLBACK] Fetched from API:', { status, duration, dialStatus, dialWhom, convDur: extracted.conversationDuration });
       }
     }
 
@@ -432,22 +488,13 @@ export default async function exotelRoutes(fastify) {
         return;
       }
 
-      let dialWhom = '';
-      if (callDetails.Legs || callDetails.legs) {
-        const legs = callDetails.Legs || callDetails.legs;
-        if (Array.isArray(legs) && legs.length > 0) {
-          const answeredLeg = legs.find(l => (l.Status || l.status || '').toLowerCase() === 'completed');
-          if (answeredLeg) dialWhom = answeredLeg.To || answeredLeg.to || '';
-        }
-      }
-      if (!dialWhom) dialWhom = callDetails.DialWhomNumber || callDetails.dialwhomnumber || '';
-
+      const { dialWhom, dialStatus, conversationDuration } = extractRmFromCallDetails(callDetails);
       const normalizedDialWhom = dialWhom ? formatPhone(dialWhom) : '';
       const disposition = classifyDisposition({
-        status, dialStatus: '', dialWhom: normalizedDialWhom, duration, rawMessage: '',
+        status, dialStatus, dialWhom: normalizedDialWhom, duration, rawMessage: '',
       });
 
-      console.log(`[POLL] Lead=${leadId} Status=${status} DialWhom=${normalizedDialWhom || '-'} Dur=${duration} → ${disposition}`);
+      console.log(`[POLL] Lead=${leadId} Status=${status} DialStatus=${dialStatus || '-'} DialWhom=${normalizedDialWhom || '-'} Dur=${duration}/${conversationDuration}s → ${disposition}`);
       await processDisposition(leadId, callSid, disposition, normalizedDialWhom, duration, recordingUrl, status, { source: 'poll' });
 
     } catch (err) {
