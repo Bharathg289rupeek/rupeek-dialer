@@ -19,7 +19,47 @@ const DEFAULT_CONFIG = {
   business_hours_start: '09:00',
   business_hours_end: '18:00',
   business_days: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat'],
+  cx_not_picked_max_attempts: 2,
+  cx_not_picked_interval_min: 10,
+  cx_drop_voicebot_max_attempts: 2,
+  cx_drop_voicebot_interval_min: 10,
+  callcenter_no_answer_max_attempts: 2,
+  callcenter_no_answer_interval_min: 10,
+  call_failed_max_attempts: 3,
+  call_failed_interval_min: 5,
 };
+
+// Rows in the retry-policy editor
+const RETRY_POLICIES = [
+  {
+    maxKey: 'cx_not_picked_max_attempts',
+    intKey: 'cx_not_picked_interval_min',
+    label: 'Customer Not Picked',
+    desc: 'Customer did not answer the outbound call',
+    color: 'text-blue-600',
+  },
+  {
+    maxKey: 'cx_drop_voicebot_max_attempts',
+    intKey: 'cx_drop_voicebot_interval_min',
+    label: 'Customer Dropped Voicebot',
+    desc: 'Customer picked up but hung up during voicebot greeting',
+    color: 'text-amber-600',
+  },
+  {
+    maxKey: 'callcenter_no_answer_max_attempts',
+    intKey: 'callcenter_no_answer_interval_min',
+    label: 'Call Centre No Answer',
+    desc: 'Call was routed to call centre but call centre did not pick up',
+    color: 'text-purple-600',
+  },
+  {
+    maxKey: 'call_failed_max_attempts',
+    intKey: 'call_failed_interval_min',
+    label: 'Call Failed (Technical)',
+    desc: 'Exotel API error or network issue',
+    color: 'text-red-600',
+  },
+];
 
 export default function GlobalSettings() {
   const [config, setConfig] = useState(null);
@@ -31,11 +71,7 @@ export default function GlobalSettings() {
   const fetchConfig = async () => {
     try {
       const c = await api.get('/api/v1/routing-config');
-      if (c && c.id) {
-        setConfig(c);
-      } else {
-        setConfig(null);
-      }
+      setConfig(c && c.id ? c : null);
     } catch {
       setConfig(null);
     } finally {
@@ -59,14 +95,20 @@ export default function GlobalSettings() {
   const handleSave = async () => {
     setSaving(true);
     try {
-      const updated = await api.put(`/api/v1/routing-config/${config.id}`, {
+      // Build payload — include all editable keys
+      const payload = {
         fallback_call_center_number: config.fallback_call_center_number,
         max_parallel_rms: parseInt(config.max_parallel_rms),
         rm_ring_duration_sec: parseInt(config.rm_ring_duration_sec),
         business_hours_start: config.business_hours_start,
         business_hours_end: config.business_hours_end,
         business_days: config.business_days,
-      });
+      };
+      for (const p of RETRY_POLICIES) {
+        payload[p.maxKey] = parseInt(config[p.maxKey]);
+        payload[p.intKey] = parseInt(config[p.intKey]);
+      }
+      const updated = await api.put(`/api/v1/routing-config/${config.id}`, payload);
       setConfig(updated);
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
@@ -95,7 +137,6 @@ export default function GlobalSettings() {
     </div>
   );
 
-  // No config exists — show create button
   if (!config?.id) {
     return (
       <div className="space-y-6 max-w-2xl">
@@ -106,7 +147,7 @@ export default function GlobalSettings() {
           </div>
           <h2 className="text-lg font-semibold">No configuration found</h2>
           <p className="text-sm text-surface-500 max-w-sm mx-auto">
-            Create default settings to get started. You can customize everything after creation.
+            Create default settings to get started. Everything is editable afterwards.
           </p>
           <div className="text-left max-w-xs mx-auto text-sm text-surface-600 space-y-1">
             <div>Business Hours: 9:00 AM – 6:00 PM IST</div>
@@ -128,7 +169,7 @@ export default function GlobalSettings() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-bold">Global Settings</h1>
-          <p className="text-sm text-surface-500 mt-0.5">Call routing defaults and business hours</p>
+          <p className="text-sm text-surface-500 mt-0.5">Call routing, business hours, and retry policies</p>
         </div>
         <button className="btn-primary" onClick={handleSave} disabled={saving}>
           {saved ? <><Check size={16} /> Saved</> : saving ? 'Saving...' : <><Save size={16} /> Save Changes</>}
@@ -141,7 +182,7 @@ export default function GlobalSettings() {
           <Clock size={18} className="text-brand-600" />
           <h3 className="text-sm font-semibold">Business Hours (IST)</h3>
         </div>
-        <p className="text-xs text-surface-500 -mt-2">Leads outside these hours are queued for next business day at start time</p>
+        <p className="text-xs text-surface-500 -mt-2">Leads outside these hours are queued for next business day</p>
 
         <div className="grid grid-cols-2 gap-4">
           <div>
@@ -183,12 +224,12 @@ export default function GlobalSettings() {
         </div>
 
         <div>
-          <label className="text-xs font-medium">Fallback Call Center Number (E.164)</label>
+          <label className="text-xs font-medium">Fallback Call Centre Number (E.164)</label>
           <input className="input mt-1 max-w-xs"
             value={config.fallback_call_center_number || ''}
             onChange={e => set('fallback_call_center_number', e.target.value)}
             placeholder="+91XXXXXXXXXX" />
-          <p className="text-xs text-surface-400 mt-1">Customer is routed here when no RM answers</p>
+          <p className="text-xs text-surface-400 mt-1">Customer is routed here when no RM mapping exists for the lead</p>
         </div>
 
         <div className="grid grid-cols-2 gap-4">
@@ -198,7 +239,7 @@ export default function GlobalSettings() {
               onChange={e => set('max_parallel_rms', e.target.value)}>
               {[1,2,3,4,5,6,7,8,9,10].map(n => <option key={n} value={n}>{n}</option>)}
             </select>
-            <p className="text-xs text-surface-400 mt-1">How many RMs are dialed at once</p>
+            <p className="text-xs text-surface-400 mt-1">How many RMs are dialled at once</p>
           </div>
           <div>
             <label className="text-xs font-medium">Ring Duration: {config.rm_ring_duration_sec || 20}s</label>
@@ -213,54 +254,52 @@ export default function GlobalSettings() {
         </div>
       </div>
 
-      {/* Retry Settings (read-only info) */}
+      {/* Retry Policies — NEW */}
       <div className="card p-6 space-y-5">
         <div className="flex items-center gap-2">
           <RotateCw size={18} className="text-brand-600" />
-          <h3 className="text-sm font-semibold">Retry & Fallback Settings</h3>
+          <h3 className="text-sm font-semibold">Retry Policies</h3>
+        </div>
+        <p className="text-xs text-surface-500 -mt-2">
+          Configure how many times the system retries each failure type, and the interval between retries.
+          WhatsApp notification fires only after the final retry is exhausted.
+        </p>
+
+        <div className="space-y-3">
+          {RETRY_POLICIES.map(p => (
+            <div key={p.maxKey} className="flex items-center gap-4 py-3 border-b border-surface-100 last:border-0">
+              <div className="flex-1 min-w-0">
+                <div className={`text-sm font-medium ${p.color}`}>{p.label}</div>
+                <div className="text-xs text-surface-500 mt-0.5">{p.desc}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <div>
+                  <label className="text-[10px] uppercase tracking-wider text-surface-400 block">Attempts</label>
+                  <input type="number" min={1} max={10}
+                    className="input w-20 mt-0.5 text-center"
+                    value={config[p.maxKey] ?? ''}
+                    onChange={e => set(p.maxKey, e.target.value)} />
+                </div>
+                <div>
+                  <label className="text-[10px] uppercase tracking-wider text-surface-400 block">Interval (min)</label>
+                  <input type="number" min={1} max={1440}
+                    className="input w-24 mt-0.5 text-center"
+                    value={config[p.intKey] ?? ''}
+                    onChange={e => set(p.intKey, e.target.value)} />
+                </div>
+              </div>
+            </div>
+          ))}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="bg-surface-50 rounded-lg p-4">
-            <div className="text-xs font-semibold text-surface-600 uppercase tracking-wider mb-2">Customer Not Picked</div>
-            <div className="text-sm space-y-1">
-              <div className="flex justify-between"><span className="text-surface-500">Max retries</span><span className="font-medium">2 attempts</span></div>
-              <div className="flex justify-between"><span className="text-surface-500">Retry interval</span><span className="font-medium">10 minutes</span></div>
-              <div className="flex justify-between"><span className="text-surface-500">After exhausted</span><span className="font-medium text-amber-600">UTM lead created</span></div>
-            </div>
-          </div>
-
-          <div className="bg-surface-50 rounded-lg p-4">
-            <div className="text-xs font-semibold text-surface-600 uppercase tracking-wider mb-2">No RM Answered</div>
-            <div className="text-sm space-y-1">
-              <div className="flex justify-between"><span className="text-surface-500">Max retries</span><span className="font-medium">3 attempts</span></div>
-              <div className="flex justify-between"><span className="text-surface-500">Retry interval</span><span className="font-medium">10 minutes</span></div>
-              <div className="flex justify-between"><span className="text-surface-500">After exhausted</span><span className="font-medium text-amber-600">UTM lead created</span></div>
-            </div>
-          </div>
-
-          <div className="bg-surface-50 rounded-lg p-4">
-            <div className="text-xs font-semibold text-surface-600 uppercase tracking-wider mb-2">Customer Drops Voicebot</div>
-            <div className="text-sm space-y-1">
-              <div className="flex justify-between"><span className="text-surface-500">Max retries</span><span className="font-medium">2 attempts</span></div>
-              <div className="flex justify-between"><span className="text-surface-500">Retry interval</span><span className="font-medium">10 minutes</span></div>
-              <div className="flex justify-between"><span className="text-surface-500">After exhausted</span><span className="font-medium text-amber-600">UTM lead created</span></div>
-            </div>
-          </div>
-
-          <div className="bg-surface-50 rounded-lg p-4">
-            <div className="text-xs font-semibold text-surface-600 uppercase tracking-wider mb-2">Call Failed (Technical)</div>
-            <div className="text-sm space-y-1">
-              <div className="flex justify-between"><span className="text-surface-500">Max retries</span><span className="font-medium">No retry</span></div>
-              <div className="flex justify-between"><span className="text-surface-500">Action</span><span className="font-medium text-red-600">Logged as CALL_FAILED</span></div>
-            </div>
-          </div>
+        <div className="bg-surface-50 rounded-lg p-3 text-xs text-surface-500">
+          <strong>Note:</strong> When all retries for a disposition are exhausted, the lead status
+          becomes <span className="font-mono">failed</span> and a WhatsApp notification is sent with
+          <span className="font-mono"> tag=not_called</span>. No intermediate notifications fire during retries.
         </div>
-
-        <p className="text-xs text-surface-400">Retry settings are system-configured. Contact engineering to modify retry counts or intervals.</p>
       </div>
 
-      {/* Current Config Info */}
+      {/* System Info */}
       <div className="card p-6">
         <h3 className="text-sm font-semibold mb-3">System Info</h3>
         <div className="text-xs text-surface-500 space-y-1 font-mono">
@@ -270,7 +309,7 @@ export default function GlobalSettings() {
         </div>
       </div>
 
-      {/* Floating save button */}
+      {/* Sticky save */}
       <div className="sticky bottom-4 flex justify-end">
         <button className="btn-primary shadow-lg" onClick={handleSave} disabled={saving}>
           {saved ? <><Check size={16} /> Saved</> : saving ? 'Saving...' : <><Save size={16} /> Save Changes</>}

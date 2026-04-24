@@ -2,16 +2,17 @@ import { query } from '../db/connection.js';
 import { findRMsForLead } from '../services/routing-engine.js';
 import { getRoutingConfig, formatPhone, isBusinessHours } from '../utils/business-hours.js';
 import { logCall } from '../services/call-orchestrator.js';
-import { scheduleRetry } from '../services/retry-manager.js';
+import { scheduleRetry, getRetryPolicy } from '../services/retry-manager.js';
 import { triggerWhatsAppNotification } from '../services/whatsapp-notify.js';
+import { WA_TAGS } from '../../../shared/constants.js';
 
-// Fetch call details from Exotel API to get real status
+// ─── Exotel helpers (module-scope, used by resolver too via re-export) ──────
+
 async function fetchExotelCallDetails(callSid) {
   const sid = process.env.EXOTEL_ACCOUNT_SID;
   const key = process.env.EXOTEL_API_KEY;
   const token = process.env.EXOTEL_API_TOKEN;
   const base = process.env.EXOTEL_API_BASE || 'https://api.exotel.com/v1';
-
   const url = `${base}/Accounts/${sid}/Calls/${callSid}.json`;
   try {
     const res = await fetch(url, {
@@ -23,14 +24,257 @@ async function fetchExotelCallDetails(callSid) {
     }
     return null;
   } catch (err) {
-    console.error('[EXOTEL-FETCH] Error fetching call details:', err.message);
+    console.error('[EXOTEL-FETCH] Error:', err.message);
     return null;
   }
 }
 
+function isExotelCallCenter(normalizedPhone) {
+  if (!normalizedPhone) return false;
+  const cc = formatPhone(process.env.EXOTEL_FALLBACK_CALL_CENTER || '');
+  return cc && normalizedPhone === cc;
+}
+
+// Best-effort INVALID_NUMBER detector.
+// Today's observed signature on this Exotel account (Test-25):
+//   multipart body with no usable fields, Status missing, Duration 0,
+//   no DialCallStatus, no DialWhomNumber.
+// We also pattern-match any textual "invalid number" message in case Exotel
+// ever sends one.
+function looksLikeInvalidNumber({ status, dialStatus, dialWhom, duration, rawMessage }) {
+  const s = (status || '').toLowerCase();
+  const d = (dialStatus || '').toLowerCase();
+  // Explicit "failed" from Exotel with zero duration and no dial info
+  if (s === 'failed' && !d && !dialWhom && duration === 0) return true;
+  // Message substring match
+  const msg = (rawMessage || '').toLowerCase();
+  if (/invalid.?number|not.?reachable|malformed|not.?a.?valid/i.test(msg)) return true;
+  return false;
+}
+
+/**
+ * Classify a terminal call outcome based on Exotel signals.
+ * Exported so services/call-resolver.js can reuse identical logic.
+ */
+export function classifyDisposition({ status, dialStatus, dialWhom, duration, rawMessage }) {
+  const s = (status || '').toLowerCase();
+  const d = (dialStatus || '').toLowerCase();
+  const normalizedDialWhom = dialWhom || '';
+  const routedToCallCenter = isExotelCallCenter(normalizedDialWhom);
+  const hasRmAnswered = !!normalizedDialWhom && !routedToCallCenter;
+
+  // 1. INVALID_NUMBER — takes priority
+  if (looksLikeInvalidNumber({ status, dialStatus, dialWhom, duration, rawMessage })) {
+    return 'INVALID_NUMBER';
+  }
+
+  // 2. Call-centre routing cases
+  if (routedToCallCenter) {
+    if (d === 'completed') return 'RM_NO_ANSWER_CALLCENTER';
+    return 'CALLCENTER_NO_ANSWER';
+  }
+
+  // 3. RM actually connected
+  if (d === 'completed' && hasRmAnswered) return 'RM_CONNECTED';
+
+  // 4. Master status completed → either RM (rare) or customer dropped voicebot
+  if (s === 'completed') return hasRmAnswered ? 'RM_CONNECTED' : 'CX_DROP_VOICEBOT';
+
+  // 5. RM leg negatives without call-centre being dialled
+  if (d === 'no-answer' || d === 'busy' || d === 'canceled') return 'CALLCENTER_NO_ANSWER';
+
+  // 6. Customer-side negatives
+  if (s === 'no-answer' || s === 'busy') return 'CUSTOMER_NOT_PICKED';
+  if (s === 'canceled') return 'CX_DROP_VOICEBOT';
+
+  // 7. Anything else
+  return 'CALL_FAILED';
+}
+
+/**
+ * Apply lead status + WhatsApp side-effects for a classified disposition.
+ * Terminal-only WhatsApp. Exported for reuse by the resolver.
+ */
+export async function applyLeadAndWhatsApp({ leadId, lead, disposition, callSid, duration, rmPhone, rmName, rmEmail, attemptCount }) {
+
+  // RM_CONNECTED
+  if (disposition === 'RM_CONNECTED') {
+    await query(
+      `UPDATE leads
+         SET status = 'connected', assigned_rm_phone = $2, assigned_rm_name = $3,
+             connected_at = NOW(), updated_at = NOW()
+       WHERE lead_id = $1`,
+      [leadId, rmPhone, rmName]
+    );
+    if (lead) await triggerWhatsAppNotification(lead, 'RM_CONNECTED', {
+      call_sid: callSid,
+      rm_who_answered: rmPhone,
+      call_duration_sec: duration,
+      attempt_number: attemptCount,
+      assigned_to: rmEmail,
+      tag: WA_TAGS.ALREADY_CALLED,
+    });
+    return;
+  }
+
+  // RM_NO_ANSWER_CALLCENTER — call centre picked up, no WhatsApp, DB record only
+  if (disposition === 'RM_NO_ANSWER_CALLCENTER') {
+    await query(
+      `UPDATE leads
+         SET status = 'call_center_handled',
+             utm_identifier = 'routed_to_callcenter',
+             connected_at = NOW(),
+             updated_at = NOW()
+       WHERE lead_id = $1`,
+      [leadId]
+    );
+    return;
+  }
+
+  // INVALID_NUMBER — terminal fail, no retry, no WhatsApp
+  if (disposition === 'INVALID_NUMBER') {
+    await query(
+      `UPDATE leads SET status = 'failed', utm_identifier = 'invalid_number', updated_at = NOW() WHERE lead_id = $1`,
+      [leadId]
+    );
+    return;
+  }
+
+  // Retry-eligible dispositions
+  const retryTypeMap = {
+    CUSTOMER_NOT_PICKED:  'cx_not_picked',
+    CX_DROP_VOICEBOT:     'cx_drop_voicebot',
+    CALLCENTER_NO_ANSWER: 'callcenter_no_answer',
+    CALL_FAILED:          'call_failed',
+  };
+  const retryType = retryTypeMap[disposition];
+  if (!retryType) {
+    console.warn(`[PROCESS] Unhandled disposition: ${disposition}`);
+    return;
+  }
+
+  const policy = await getRetryPolicy(retryType);
+
+  if (attemptCount < policy.max_attempts) {
+    // Schedule another retry. No WhatsApp — terminal-only policy.
+    await scheduleRetry(leadId, retryType, attemptCount + 1, policy.max_attempts);
+    return;
+  }
+
+  // Retry exhausted → terminal failure + single WhatsApp
+  await query(
+    `UPDATE leads SET status = 'failed', utm_identifier = $2, updated_at = NOW() WHERE lead_id = $1`,
+    [leadId, retryType]
+  );
+
+  if (lead) {
+    await triggerWhatsAppNotification(lead, disposition, {
+      call_sid: callSid,
+      call_duration_sec: duration,
+      attempt_number: attemptCount,
+      assigned_to: null,
+      tag: WA_TAGS.NOT_CALLED,
+      disposition_override: 'CUSTOMER_NOT_PICKED',
+    });
+  }
+}
+
+/**
+ * Shared disposition-processing pipeline. Used by both the HTTP status-callback
+ * handler and the in-process poll. Exported so services/call-resolver.js can
+ * reuse the same pipeline (pg-boss cron job).
+ */
+export async function processDisposition(leadId, callSid, disposition, normalizedDialWhom, duration, recordingUrl, exotelStatus, rawData) {
+  // Dedup — skip if already resolved
+  const existing = await query(
+    `SELECT disposition FROM call_logs WHERE lead_id = $1 AND disposition NOT IN ('INITIATED') LIMIT 1`,
+    [leadId]
+  );
+  if (existing.rows.length > 0) {
+    console.log(`[PROCESS] ${leadId} already has ${existing.rows[0].disposition}, skipping`);
+    return;
+  }
+
+  // RM lookup — now fetches email too (for assigned_to in WhatsApp payload)
+  const rmPhoneForStorage = disposition === 'RM_CONNECTED' ? normalizedDialWhom : null;
+  let rmName = null, rmEmail = null;
+  if (rmPhoneForStorage) {
+    const r = await query(
+      `SELECT agent_name, agent_email FROM agents WHERE agent_phone = $1 AND is_active = true LIMIT 1`,
+      [rmPhoneForStorage]
+    );
+    rmName = r.rows[0]?.agent_name || null;
+    rmEmail = r.rows[0]?.agent_email || null;
+  }
+
+  const toNumberForStorage = normalizedDialWhom || null;
+
+  // Single UPDATE on the INITIATED row
+  const updateRes = await query(
+    `UPDATE call_logs
+       SET disposition = $1,
+           call_sid = COALESCE(call_sid, $2),
+           exotel_status = $3,
+           call_duration_sec = $4,
+           rm_who_answered = $5,
+           recording_url = $6,
+           to_number = COALESCE(to_number, $7),
+           metadata = COALESCE(metadata, '{}'::jsonb) || $8::jsonb
+     WHERE id = (SELECT id FROM call_logs
+                 WHERE lead_id = $9 AND disposition = 'INITIATED'
+                 ORDER BY created_at DESC LIMIT 1)
+     RETURNING id`,
+    [
+      disposition, callSid, exotelStatus, duration,
+      rmPhoneForStorage, recordingUrl, toNumberForStorage,
+      JSON.stringify({
+        source: rawData?.source || 'callback',
+        routed_to_callcenter: disposition === 'RM_NO_ANSWER_CALLCENTER',
+        callcenter_no_answer: disposition === 'CALLCENTER_NO_ANSWER',
+        invalid_number: disposition === 'INVALID_NUMBER',
+        raw: rawData,
+      }),
+      leadId,
+    ]
+  );
+
+  // Defensive fallback — insert fresh if no INITIATED row existed
+  if (updateRes.rowCount === 0) {
+    console.warn(`[PROCESS] No INITIATED row for ${leadId}, inserting fresh`);
+    await logCall(leadId, {
+      call_sid: callSid,
+      call_type: 'outbound_cx',
+      direction: 'outbound',
+      to_number: toNumberForStorage,
+      disposition,
+      rm_who_answered: rmPhoneForStorage,
+      call_duration_sec: duration,
+      recording_url: recordingUrl,
+      exotel_status: exotelStatus,
+      metadata: { source: rawData?.source || 'callback_no_init', raw: rawData },
+    });
+  }
+
+  // Fetch lead + attempt count, then apply status + WhatsApp side-effects
+  const leadRes = await query(`SELECT * FROM leads WHERE lead_id = $1`, [leadId]);
+  const lead = leadRes.rows[0];
+  const attemptsRes = await query(
+    `SELECT COUNT(*) as cnt FROM call_logs WHERE lead_id = $1 AND call_type = 'outbound_cx' AND disposition NOT IN ('INITIATED')`,
+    [leadId]
+  );
+  const attemptCount = parseInt(attemptsRes.rows[0]?.cnt || 1);
+
+  await applyLeadAndWhatsApp({
+    leadId, lead, disposition, callSid, duration,
+    rmPhone: rmPhoneForStorage, rmName, rmEmail, attemptCount,
+  });
+}
+
+// ─── Route registration ─────────────────────────────────────────────────────
+
 export default async function exotelRoutes(fastify) {
 
-  // Passthru — CX picks up, check lead validity
+  // Passthru — customer picked up
   fastify.all('/api/v1/exotel/passthru', async (request, reply) => {
     const params = { ...request.query, ...request.body };
     const leadId = params.CustomField || params.customfield;
@@ -49,19 +293,19 @@ export default async function exotelRoutes(fastify) {
 
     if (callSid) {
       await query(
-        `UPDATE call_logs SET call_sid = $1 WHERE id = (SELECT id FROM call_logs WHERE lead_id = $2 AND call_sid IS NULL ORDER BY created_at DESC LIMIT 1)`,
+        `UPDATE call_logs SET call_sid = $1
+           WHERE id = (SELECT id FROM call_logs WHERE lead_id = $2 AND call_sid IS NULL ORDER BY created_at DESC LIMIT 1)`,
         [callSid, leadId]
       );
-      // Schedule status poll after 45 seconds (call should be done by then)
+      // Fast-path polls. Durable backup lives in services/call-resolver.js.
       setTimeout(() => pollCallStatus(callSid, leadId), 45000);
-      // Also poll after 90 seconds as backup
       setTimeout(() => pollCallStatus(callSid, leadId), 90000);
     }
 
     return reply.status(200).send('OK');
   });
 
-  // Connect — return RM numbers for parallel dialing
+  // Connect — return RM numbers for parallel ringing
   fastify.all('/api/v1/exotel/connect', async (request, reply) => {
     const params = { ...request.query, ...request.body };
     const leadId = params.CustomField || params.customfield;
@@ -86,7 +330,7 @@ export default async function exotelRoutes(fastify) {
     const routing = await findRMsForLead(lead);
 
     if (routing.agents.length === 0) {
-      console.log('[CONNECT] No agents, fallback to call center');
+      console.log('[CONNECT] No agents matched, returning call-centre fallback');
       return {
         destination: { numbers: [config?.fallback_call_center_number || process.env.FALLBACK_CALL_CENTER_NUMBER] },
         parallel_ringing: { activate: false },
@@ -112,8 +356,7 @@ export default async function exotelRoutes(fastify) {
     };
   });
 
-  // Status Callback — Exotel calls this after call ends
-  // Handles both form-urlencoded and JSON, plus empty body fallback
+  // Status Callback — Exotel POSTs here after call ends
   fastify.all('/api/v1/exotel/status-callback', async (request, reply) => {
     const data = { ...request.query, ...request.body };
     console.log('[STATUS-CALLBACK] raw query:', JSON.stringify(request.query));
@@ -128,16 +371,15 @@ export default async function exotelRoutes(fastify) {
       return reply.status(200).send('OK');
     }
 
-    // Try to get status from callback data first
     let status = data.Status || data.status || '';
     let dialStatus = data.DialCallStatus || data.dialcallstatus || '';
     let dialWhom = data.DialWhomNumber || data.dialwhomnumber || '';
     let duration = parseInt(data.Duration || data.duration || data.DialCallDuration || 0);
     let recordingUrl = data.RecordingUrl || data.recordingurl || '';
+    const rawMessage = data.Message || data.message || data.ErrorMessage || '';
 
-    // If callback body is empty, fetch from Exotel API
     if (!status && callSid) {
-      console.log('[STATUS-CALLBACK] Empty status, fetching from Exotel API for CallSid:', callSid);
+      console.log('[STATUS-CALLBACK] Empty status, fetching from Exotel API');
       const callDetails = await fetchExotelCallDetails(callSid);
       if (callDetails) {
         status = callDetails.Status || callDetails.status || '';
@@ -148,245 +390,68 @@ export default async function exotelRoutes(fastify) {
       }
     }
 
-    // If still no status or call still in progress — skip, let poll handle it
     const lowerStatusCheck = status.toLowerCase();
     if (!status || lowerStatusCheck === 'in-progress' || lowerStatusCheck === 'ringing' || lowerStatusCheck === 'queued') {
-      console.log(`[STATUS-CALLBACK] Call still ${status || 'unknown'}, skipping — poll will handle`);
+      console.log(`[STATUS-CALLBACK] Still ${status || 'unknown'} — letting resolver handle`);
       return reply.status(200).send('OK');
     }
 
-    // ── Disposition logic ────────────────────────────────────────────────
-    // Key principle: RM_CONNECTED requires BOTH DialCallStatus=completed AND a
-    // populated DialWhomNumber. Master Status=completed alone only means "call
-    // ended cleanly" — customer may have hung up during voicebot or ringback.
-    // Duration > 5s is NOT a reliable signal (voicebot + ringback can easily
-    // run 20-30s before the customer hangs up).
-    let disposition = 'CALL_FAILED';
-    const lowerStatus = status.toLowerCase();
-    const lowerDial = dialStatus.toLowerCase();
-    const hasRmAnswered = dialWhom && dialWhom.trim() !== '';
+    const normalizedDialWhom = dialWhom ? formatPhone(dialWhom) : '';
+    const disposition = classifyDisposition({
+      status, dialStatus, dialWhom: normalizedDialWhom, duration, rawMessage,
+    });
 
-    if (lowerDial === 'completed' && hasRmAnswered) {
-      // RM leg completed AND we know which RM — genuine connection
-      disposition = 'RM_CONNECTED';
-    } else if (lowerDial === 'no-answer' || lowerDial === 'busy') {
-      // RM leg attempted but nobody answered
-      disposition = 'RM_NO_ANSWER';
-    } else if (lowerDial === 'canceled') {
-      // RM leg cancelled — typically customer hung up during ringback
-      disposition = 'CX_DROP_VOICEBOT';
-    } else if (lowerStatus === 'no-answer' || lowerStatus === 'busy') {
-      // Customer leg never answered
-      disposition = 'CUSTOMER_NOT_PICKED';
-    } else if (lowerStatus === 'canceled') {
-      disposition = 'CX_DROP_VOICEBOT';
-    } else if (lowerStatus === 'completed') {
-      // Master status completed but no DialCallStatus evidence of RM connect —
-      // customer most likely hung up during voicebot greeting
-      disposition = hasRmAnswered ? 'RM_CONNECTED' : 'CX_DROP_VOICEBOT';
-    }
+    console.log(`[STATUS-CALLBACK] Lead=${leadId} Status=${status} DialStatus=${dialStatus} DialWhom=${normalizedDialWhom || '-'} Dur=${duration} → ${disposition}`);
 
-    console.log(`[STATUS-CALLBACK] Lead: ${leadId}, Status: ${status}, DialStatus: ${dialStatus}, DialWhom: ${dialWhom || '(empty)'}, Duration: ${duration}, → Disposition: ${disposition}`);
-
-    await processDisposition(leadId, callSid, disposition, dialWhom, duration, recordingUrl, status, { source: 'status-callback', raw: data });
+    await processDisposition(leadId, callSid, disposition, normalizedDialWhom, duration, recordingUrl, status, { source: 'status-callback', raw: data });
 
     return reply.status(200).send('OK');
   });
 
-  /**
-   * Poll call status from Exotel API — called 45s and 90s after call starts.
-   * This is the backup mechanism when StatusCallback body is empty.
-   */
+  // Fast-path in-process poll
   async function pollCallStatus(callSid, leadId) {
     try {
-      // Check if already processed
       const existing = await query(
-        `SELECT disposition FROM call_logs WHERE lead_id = $1 AND disposition NOT IN ('INITIATED', 'CALL_FAILED') LIMIT 1`,
+        `SELECT disposition FROM call_logs WHERE lead_id = $1 AND disposition NOT IN ('INITIATED') LIMIT 1`,
         [leadId]
       );
       if (existing.rows.length > 0) {
-        console.log(`[POLL] ${leadId} already has disposition: ${existing.rows[0].disposition}, skipping`);
+        console.log(`[POLL] ${leadId} already has ${existing.rows[0].disposition}, skipping`);
         return;
       }
 
-      console.log(`[POLL] Fetching call details for ${callSid} (lead: ${leadId})`);
       const callDetails = await fetchExotelCallDetails(callSid);
-      if (!callDetails) {
-        console.log(`[POLL] No details found for ${callSid}`);
-        return;
-      }
+      if (!callDetails) return;
 
       const status = (callDetails.Status || callDetails.status || '').toLowerCase();
       const duration = parseInt(callDetails.Duration || callDetails.duration || 0);
       const recordingUrl = callDetails.RecordingUrl || callDetails.recording_url || '';
 
-      // Only process if call is finished
       if (status === 'in-progress' || status === 'ringing' || status === 'queued') {
-        console.log(`[POLL] Call ${callSid} still ${status}, will check again later`);
+        console.log(`[POLL] ${callSid} still ${status}`);
         return;
       }
 
-      // Try to find which RM answered (best-effort).
-      // For parallel_ringing calls, the master /Calls/{sid}.json endpoint
-      // usually does NOT include leg-level info, so this is often empty.
       let dialWhom = '';
       if (callDetails.Legs || callDetails.legs) {
         const legs = callDetails.Legs || callDetails.legs;
         if (Array.isArray(legs) && legs.length > 0) {
           const answeredLeg = legs.find(l => (l.Status || l.status || '').toLowerCase() === 'completed');
-          if (answeredLeg) {
-            dialWhom = answeredLeg.To || answeredLeg.to || '';
-          }
+          if (answeredLeg) dialWhom = answeredLeg.To || answeredLeg.to || '';
         }
       }
-      if (!dialWhom) {
-        dialWhom = callDetails.DialWhomNumber || callDetails.dialwhomnumber || '';
-      }
+      if (!dialWhom) dialWhom = callDetails.DialWhomNumber || callDetails.dialwhomnumber || '';
 
-      const hasRmAnswered = dialWhom && dialWhom.trim() !== '';
+      const normalizedDialWhom = dialWhom ? formatPhone(dialWhom) : '';
+      const disposition = classifyDisposition({
+        status, dialStatus: '', dialWhom: normalizedDialWhom, duration, rawMessage: '',
+      });
 
-      // Disposition — poll is best-effort fallback. Same principle:
-      // completed status WITHOUT a known RM is treated as customer drop.
-      let disposition = 'CALL_FAILED';
-      if (status === 'completed' && hasRmAnswered) {
-        disposition = 'RM_CONNECTED';
-      } else if (status === 'completed') {
-        // Call ended cleanly but we couldn't identify an RM — customer drop
-        disposition = 'CX_DROP_VOICEBOT';
-      } else if (status === 'no-answer' || status === 'busy') {
-        disposition = 'CUSTOMER_NOT_PICKED';
-      } else if (status === 'canceled') {
-        disposition = 'CX_DROP_VOICEBOT';
-      }
-
-      console.log(`[POLL] Lead: ${leadId}, Status: ${status}, DialWhom: ${dialWhom || '(empty)'}, Duration: ${duration}, → Disposition: ${disposition}`);
-
-      await processDisposition(leadId, callSid, disposition, dialWhom, duration, recordingUrl, status, { source: 'poll' });
+      console.log(`[POLL] Lead=${leadId} Status=${status} DialWhom=${normalizedDialWhom || '-'} Dur=${duration} → ${disposition}`);
+      await processDisposition(leadId, callSid, disposition, normalizedDialWhom, duration, recordingUrl, status, { source: 'poll' });
 
     } catch (err) {
       console.error(`[POLL] Error polling ${callSid}:`, err.message);
-    }
-  }
-
-  /**
-   * Shared disposition processing — used by both StatusCallback and polling.
-   * Single-write path: UPDATEs the INITIATED row in place, or INSERTs if missing.
-   * Captures rm_who_answered + assigned_rm_name on RM_CONNECTED.
-   */
-  async function processDisposition(leadId, callSid, disposition, dialWhom, duration, recordingUrl, exotelStatus, rawData) {
-    // Dedup: skip if already processed with a real disposition
-    const existing = await query(
-      `SELECT disposition FROM call_logs WHERE lead_id = $1 AND disposition NOT IN ('INITIATED', 'CALL_FAILED') LIMIT 1`,
-      [leadId]
-    );
-    if (existing.rows.length > 0) {
-      console.log(`[PROCESS] ${leadId} already has ${existing.rows[0].disposition}, skipping duplicate`);
-      return;
-    }
-
-    // Normalize RM phone and look up RM name if we have a phone
-    const normalizedRm = disposition === 'RM_CONNECTED' && dialWhom ? formatPhone(dialWhom) : null;
-    let rmName = null;
-    if (normalizedRm) {
-      const r = await query(
-        `SELECT agent_name FROM agents WHERE agent_phone = $1 AND is_active = true LIMIT 1`,
-        [normalizedRm]
-      );
-      rmName = r.rows[0]?.agent_name || null;
-    }
-
-    // SINGLE WRITE PATH: update the existing INITIATED row in place
-    const updateRes = await query(
-      `UPDATE call_logs
-         SET disposition = $1,
-             call_sid = COALESCE(call_sid, $2),
-             exotel_status = $3,
-             call_duration_sec = $4,
-             rm_who_answered = $5,
-             recording_url = $6,
-             to_number = COALESCE(to_number, $7),
-             metadata = COALESCE(metadata, '{}'::jsonb) || $8::jsonb
-       WHERE id = (SELECT id FROM call_logs
-                   WHERE lead_id = $9 AND disposition = 'INITIATED'
-                   ORDER BY created_at DESC LIMIT 1)
-       RETURNING id`,
-      [
-        disposition,
-        callSid,
-        exotelStatus,
-        duration,
-        normalizedRm,
-        recordingUrl,
-        normalizedRm,
-        JSON.stringify({ source: rawData?.source || 'callback', raw: rawData }),
-        leadId,
-      ]
-    );
-
-    // Defensive fallback: no INITIATED row found (should not happen, but don't lose the call)
-    if (updateRes.rowCount === 0) {
-      console.warn(`[PROCESS] No INITIATED row for ${leadId}, inserting fresh`);
-      await logCall(leadId, {
-        call_sid: callSid,
-        call_type: 'outbound_cx',
-        direction: 'outbound',
-        to_number: normalizedRm,
-        disposition,
-        rm_who_answered: normalizedRm,
-        call_duration_sec: duration,
-        recording_url: recordingUrl,
-        exotel_status: exotelStatus,
-        metadata: { source: rawData?.source || 'callback_no_init', raw: rawData },
-      });
-    }
-
-    // Get lead data
-    const leadRes = await query(`SELECT * FROM leads WHERE lead_id = $1`, [leadId]);
-    const lead = leadRes.rows[0];
-
-    // Get attempt count
-    const attemptsRes = await query(
-      `SELECT COUNT(*) as cnt FROM call_logs WHERE lead_id = $1 AND call_type = 'outbound_cx' AND disposition NOT IN ('INITIATED')`,
-      [leadId]
-    );
-    const attemptCount = parseInt(attemptsRes.rows[0]?.cnt || 1);
-
-    if (disposition === 'RM_CONNECTED') {
-      await query(
-        `UPDATE leads
-           SET status = 'connected',
-               assigned_rm_phone = $2,
-               assigned_rm_name = $3,
-               connected_at = NOW(),
-               updated_at = NOW()
-         WHERE lead_id = $1`,
-        [leadId, normalizedRm, rmName]
-      );
-      if (lead) await triggerWhatsAppNotification(lead, disposition, { call_sid: callSid, rm_who_answered: normalizedRm, call_duration_sec: duration, attempt_number: attemptCount });
-
-    } else if (disposition === 'CUSTOMER_NOT_PICKED' || disposition === 'CX_DROP_VOICEBOT') {
-      if (attemptCount < 2) {
-        await scheduleRetry(leadId, 'cx_no_answer', attemptCount + 1, 2);
-      } else if (lead) {
-        const { createUtmLead } = await import('../services/utm-creator.js');
-        await createUtmLead(lead, 'cx_no_answer');
-        await triggerWhatsAppNotification(lead, 'UTM_LEAD_CREATED', { attempt_number: attemptCount });
-      }
-      if (lead) await triggerWhatsAppNotification(lead, disposition, { attempt_number: attemptCount });
-
-    } else if (disposition === 'RM_NO_ANSWER') {
-      if (attemptCount < 3) {
-        await scheduleRetry(leadId, 'rm_no_answer', attemptCount + 1, 3);
-      } else if (lead) {
-        const { createUtmLead } = await import('../services/utm-creator.js');
-        await createUtmLead(lead, 'rm_no_answer');
-        await triggerWhatsAppNotification(lead, 'UTM_LEAD_CREATED', { attempt_number: attemptCount });
-      }
-      if (lead) await triggerWhatsAppNotification(lead, disposition, { call_sid: callSid, attempt_number: attemptCount });
-
-    } else if (disposition === 'CALL_FAILED') {
-      await query(`UPDATE leads SET status = 'failed', updated_at = NOW() WHERE lead_id = $1`, [leadId]);
-      if (lead) await triggerWhatsAppNotification(lead, disposition, { attempt_number: attemptCount });
     }
   }
 
@@ -407,7 +472,10 @@ export default async function exotelRoutes(fastify) {
       await query(`INSERT INTO leads (lead_id, customer_phone, lead_source, status) VALUES ($1, $2, 'inbound', 'in_progress')`, [leadId, callerPhone]);
     }
 
-    await logCall(leadId, { call_sid: callSid, call_type: 'inbound', direction: 'inbound', from_number: callerPhone, disposition: 'INBOUND_INITIATED' });
+    await logCall(leadId, {
+      call_sid: callSid, call_type: 'inbound', direction: 'inbound',
+      from_number: callerPhone, disposition: 'INBOUND_INITIATED',
+    });
     return reply.status(200).send('OK');
   });
 

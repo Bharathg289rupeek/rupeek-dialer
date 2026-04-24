@@ -1,5 +1,6 @@
 import PgBoss from 'pg-boss';
 import { processPendingRetries, processQueuedLeads } from '../services/retry-manager.js';
+import { resolveStuckCalls } from '../services/call-resolver.js';
 
 let boss = null;
 
@@ -17,29 +18,41 @@ export async function startWorkers() {
   await boss.start();
   console.log('pg-boss started');
 
-  // Retry worker — every 60 seconds
-  await boss.schedule('process-retries', '* * * * *'); // every minute
+  // 1. Retry worker — picks up due rows from retry_queue, triggers retries
+  await boss.schedule('process-retries', '* * * * *');
   await boss.work('process-retries', async () => {
     try {
       const result = await processPendingRetries();
-      if (result.processed > 0) console.log(`Retries processed: ${result.processed}`);
+      if (result.processed > 0) console.log(`[WORKER] retries processed: ${result.processed}`);
     } catch (err) {
-      console.error('Retry worker error:', err.message);
+      console.error('[WORKER] retry error:', err.message);
     }
   });
 
-  // Queue processor — every 60 seconds
+  // 2. Queue processor — picks up queued (after-hours) leads when business hours open
   await boss.schedule('process-queue', '* * * * *');
   await boss.work('process-queue', async () => {
     try {
       const result = await processQueuedLeads();
-      if (result.processed > 0) console.log(`Queued leads processed: ${result.processed}`);
+      if (result.processed > 0) console.log(`[WORKER] queued leads processed: ${result.processed}`);
     } catch (err) {
-      console.error('Queue worker error:', err.message);
+      console.error('[WORKER] queue error:', err.message);
     }
   });
 
-  console.log('Workers registered: process-retries, process-queue');
+  // 3. Stuck-call resolver — durable backup for StatusCallback misses.
+  //    In-process setTimeout polls don't survive server restarts; this does.
+  await boss.schedule('resolve-stuck-calls', '* * * * *');
+  await boss.work('resolve-stuck-calls', async () => {
+    try {
+      const result = await resolveStuckCalls();
+      if (result.processed > 0) console.log(`[WORKER] stuck calls resolved: ${result.processed}`);
+    } catch (err) {
+      console.error('[WORKER] resolver error:', err.message);
+    }
+  });
+
+  console.log('Workers registered: process-retries, process-queue, resolve-stuck-calls');
   return boss;
 }
 

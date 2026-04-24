@@ -1,11 +1,28 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Search, Download, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Search, ChevronLeft, ChevronRight } from 'lucide-react';
 import api from '../hooks/api';
 
 const STATUS_BADGE = {
-  new: 'badge-blue', in_progress: 'badge-yellow', connected: 'badge-green',
-  queued: 'badge-purple', failed: 'badge-red', utm_created: 'badge-gray',
+  new:                   'badge-blue',
+  in_progress:           'badge-yellow',
+  cx_notpicked_retrying: 'badge-yellow',
+  connected:             'badge-green',
+  call_center_handled:   'badge-purple',
+  queued:                'badge-purple',
+  failed:                'badge-red',
+  utm_created:           'badge-gray',   // historical only
+};
+
+const STATUS_LABEL = {
+  new:                   'new',
+  in_progress:           'in progress',
+  cx_notpicked_retrying: 'retrying',
+  connected:             'connected',
+  call_center_handled:   'call centre',
+  queued:                'queued',
+  failed:                'failed',
+  utm_created:           'utm (legacy)',
 };
 
 export default function Leads() {
@@ -53,7 +70,6 @@ export default function Leads() {
         <span className="text-sm text-surface-500">{data.total} total</span>
       </div>
 
-      {/* Filters */}
       <div className="flex flex-wrap gap-3">
         <div className="relative flex-1 min-w-[200px] max-w-xs">
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400" />
@@ -62,7 +78,7 @@ export default function Leads() {
         </div>
         <select className="select w-auto" value={status} onChange={e => setFilter('status', e.target.value)}>
           <option value="">All Statuses</option>
-          {Object.keys(STATUS_BADGE).map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+          {Object.keys(STATUS_BADGE).map(s => <option key={s} value={s}>{STATUS_LABEL[s] || s.replace(/_/g, ' ')}</option>)}
         </select>
         <select className="select w-auto" value={source} onChange={e => setFilter('source', e.target.value)}>
           <option value="">All Sources</option>
@@ -72,7 +88,6 @@ export default function Leads() {
         </select>
       </div>
 
-      {/* Table */}
       <div className="card table-wrapper">
         <table>
           <thead>
@@ -100,7 +115,7 @@ export default function Leads() {
                 <td className="font-mono text-xs">{l.customer_phone}</td>
                 <td>{l.city || '—'}</td>
                 <td><span className="badge-blue">{l.lead_source}</span></td>
-                <td><span className={STATUS_BADGE[l.status] || 'badge-gray'}>{l.status}</span></td>
+                <td><span className={STATUS_BADGE[l.status] || 'badge-gray'}>{STATUS_LABEL[l.status] || l.status}</span></td>
                 <td className="text-xs">{l.assigned_rm_name || l.assigned_rm_phone || '—'}</td>
                 <td>{l.call_count || 0}</td>
                 <td className="text-xs text-surface-500">{new Date(l.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}</td>
@@ -110,13 +125,12 @@ export default function Leads() {
         </table>
       </div>
 
-      {/* Pagination */}
       {totalPages > 1 && (
         <div className="flex items-center justify-between">
           <span className="text-sm text-surface-500">Page {page} of {totalPages}</span>
           <div className="flex gap-2">
             <button className="btn-secondary btn-sm" disabled={page <= 1}
-              onClick={() => setFilter('page', String(page - 1)) || setParams(p => { p.set('page', page - 1); return p; })}>
+              onClick={() => { const next = new URLSearchParams(params); next.set('page', page - 1); setParams(next); }}>
               <ChevronLeft size={14} /> Prev
             </button>
             <button className="btn-secondary btn-sm" disabled={page >= totalPages}

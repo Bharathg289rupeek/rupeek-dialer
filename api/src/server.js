@@ -29,18 +29,27 @@ const app = Fastify({
   trustProxy: true,
 });
 
-// Plugins
+// ─── Plugins ───────────────────────────────────────────────────────────────
 await app.register(cors, { origin: true, credentials: true });
-await app.register(formbody);  // Parse application/x-www-form-urlencoded (Exotel callbacks)
-await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } });
+await app.register(formbody);  // application/x-www-form-urlencoded
 
-// Auth decorator
+// CRITICAL: Exotel sends status callbacks as multipart/form-data on this
+// account. Without attachFieldsToBody:'keyValues' the body arrives as
+// `undefined` and every callback becomes a black hole.
+// File uploads (agent CSV) still work: the CSV route calls request.file()
+// explicitly, which bypasses the keyValues body attachment.
+await app.register(multipart, {
+  limits: { fileSize: 10 * 1024 * 1024 },
+  attachFieldsToBody: 'keyValues',
+});
+
+// ─── Auth ──────────────────────────────────────────────────────────────────
 app.decorate('auth', authMiddleware);
 
-// Health check
+// ─── Health ────────────────────────────────────────────────────────────────
 app.get('/health', async () => ({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// Register routes
+// ─── Routes ────────────────────────────────────────────────────────────────
 await app.register(authRoutes);
 await app.register(leadRoutes);
 await app.register(agentRoutes);
@@ -50,7 +59,7 @@ await app.register(routingConfigRoutes);
 await app.register(callLogRoutes);
 await app.register(dashboardRoutes);
 
-// Serve dashboard static files in production
+// ─── Dashboard static ──────────────────────────────────────────────────────
 const dashboardPath = path.join(__dirname, '../../dashboard/dist');
 const dashboardExists = fs.existsSync(dashboardPath) && fs.existsSync(path.join(dashboardPath, 'index.html'));
 
@@ -76,7 +85,7 @@ if (dashboardExists) {
   });
 }
 
-// Start
+// ─── Boot ──────────────────────────────────────────────────────────────────
 const port = parseInt(process.env.PORT || '3000');
 const host = '0.0.0.0';
 
