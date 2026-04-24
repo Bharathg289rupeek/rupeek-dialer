@@ -35,44 +35,57 @@ async function fetchExotelCallDetails(callSid) {
 /**
  * Extract RM phone + synthetic dial status from an Exotel Call Details response.
  *
- * Exotel's behaviour on this account (confirmed by live inspection):
- *   - For a connect-applet outbound call, Exotel rewrites the master `To`
- *     field to the number that actually answered after the call completes.
- *   - So when Status=completed, `Call.To` is the RM who picked up.
- *   - `Details.Leg2Status` tells us whether the RM leg succeeded.
- *   - `Details.ConversationDuration` is actual talk time (in seconds).
+ * Exotel's behaviour on this account (verified by live inspection of Test-28
+ * and Test-29):
+ *   - When an RM actually answers, Exotel rewrites Call.To to that RM's phone
+ *     AND sets Details.Leg2Status = 'completed'.
+ *   - When NOBODY answers (customer hangs up during ringback), Call.To stays
+ *     as the originally-dialled number (usually our Exophone) and
+ *     Details.Leg2Status is missing or non-'completed'.
  *
- * Returns { dialWhom, dialStatus, conversationDuration } — callers use these
- * instead of the raw callback fields when the callback body is bare.
+ * So we need BOTH signals before trusting Call.To as an RM:
+ *   1. Call.Status = completed
+ *   2. Details.Leg2Status = completed
+ *   3. Call.To is not our own Exophone
+ *   4. Call.To != Call.From
+ *   5. Direction starts with "outbound"
+ *
+ * Returns { dialWhom, dialStatus, conversationDuration }.
  */
 export function extractRmFromCallDetails(callDetails) {
   if (!callDetails) return { dialWhom: '', dialStatus: '', conversationDuration: 0 };
 
-  // Primary source: the rewritten `To` field on a completed outbound call.
-  // If From == To, we're looking at an edge case (self-dial?); skip it.
-  let dialWhom = '';
   const to = callDetails.To || callDetails.to || '';
   const from = callDetails.From || callDetails.from || '';
+  const phoneNumberSid = callDetails.PhoneNumberSid || callDetails.phoneNumberSid || '';
   const direction = (callDetails.Direction || callDetails.direction || '').toLowerCase();
   const status = (callDetails.Status || callDetails.status || '').toLowerCase();
 
-  if (status === 'completed' && to && to !== from && direction.startsWith('outbound')) {
+  const details = callDetails.Details || callDetails.details || {};
+  const leg2Status = (details.Leg2Status || details.leg2Status || '').toLowerCase();
+  const conversationDuration = parseInt(details.ConversationDuration || details.conversationDuration || 0);
+
+  // Synthetic dial status reflects Leg2 (the RM leg). This drives the classifier.
+  const dialStatus = leg2Status || '';
+
+  // Guard rails for trusting `To` as an RM number:
+  const exophone = (process.env.EXOPHONE || '').replace(/\D/g, '');
+  const toDigits = to.replace(/\D/g, '');
+  const phoneNumberSidDigits = phoneNumberSid.replace(/\D/g, '');
+  const isOurOwnNumber = (exophone && toDigits.endsWith(exophone)) ||
+                        (phoneNumberSidDigits && toDigits.endsWith(phoneNumberSidDigits));
+
+  let dialWhom = '';
+  const rmDidAnswer = status === 'completed'
+                   && leg2Status === 'completed'
+                   && conversationDuration > 0;
+
+  if (rmDidAnswer && to && to !== from && !isOurOwnNumber && direction.startsWith('outbound')) {
     dialWhom = to;
   }
 
-  // Fallback to documented fields in case Exotel changes behaviour
+  // Explicit documented fields as fallback — unlikely on this account but free insurance
   if (!dialWhom) dialWhom = callDetails.DialWhomNumber || callDetails.dialwhomnumber || '';
-
-  // Leg2Status on a connect-applet call reflects the RM-leg outcome.
-  // Leg1 is the customer leg. If Leg2 is completed, an RM answered.
-  const details = callDetails.Details || callDetails.details || {};
-  const leg2Status = details.Leg2Status || details.leg2Status || '';
-  const conversationDuration = parseInt(details.ConversationDuration || details.conversationDuration || 0);
-
-  // Synthesize a DialCallStatus from Leg2Status so the classifier can treat
-  // this the same as a direct status-callback that did have DialCallStatus.
-  let dialStatus = '';
-  if (leg2Status) dialStatus = leg2Status.toLowerCase();
 
   return { dialWhom, dialStatus, conversationDuration };
 }
